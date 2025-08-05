@@ -269,7 +269,7 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
         Printf.sprintf "  sw fp, %d(sp)" (stack_size - 8);
         Printf.sprintf "  addi fp, sp, %d" stack_size; ]
   | Epilogue (fname, stack_size) ->
-      [ ".L_ret_" ^ fname ^ ":";
+      [ "L_ret_" ^ fname ^ ":";
         Printf.sprintf "  lw fp, %d(sp)" (stack_size - 8);
         Printf.sprintf "  lw ra, %d(sp)" (stack_size - 4);
         Printf.sprintf "  addi sp, sp, %d" stack_size;
@@ -322,7 +322,7 @@ let gen_assembly (ir_code: ir list) : string list =
     | Prologue (fname, _) -> current_fname := fname
     | Epilogue (fname, _) -> current_fname := fname
     | _ -> ());
-    if ir = Ret then [Printf.sprintf "  j .L_ret_%s" !current_fname]
+    if ir = Ret then [Printf.sprintf "  j L_ret_%s" !current_fname]
     else ir_to_asm_list_internal ir
   in
   List.concat_map convert_ir_to_asm ir_code
