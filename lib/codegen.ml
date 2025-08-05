@@ -568,7 +568,7 @@ and gen_stmt_ir_internal env ?break_lbl ?cont_lbl (s: stmt) : ir list =
   | Break -> (match break_lbl with Some lbl -> [Jump lbl] | None -> failwith "break statement not within a loop")
   | Continue -> (match cont_lbl with Some lbl -> [Jump lbl] | None -> failwith "continue statement not within a loop")
 
-let gen_func_ir_internal (ana: Semantic.analysis_result) (f: func_def) : ir list =
+(* let gen_func_ir_internal (ana: Semantic.analysis_result) (f: func_def) : ir list =
   (* MODIFIED: Pre-calculate stack size correctly *)
   let num_local_decls = List.assoc f.fname ana.local_var_counts in
   let num_temps = 6 in (* Max temp registers t0-t5 *)
@@ -603,6 +603,53 @@ let gen_func_ir_internal (ana: Semantic.analysis_result) (f: func_def) : ir list
 
   let body_ir = List.concat_map (gen_stmt_ir_internal env) f.body in
 
+  [Prologue (f.fname, stack_size)] @ params_save_ir @ body_ir @ [Epilogue (f.fname, stack_size)] *)
+
+  (* In lib/codegen.ml, replace the entire gen_func_ir_internal function *)
+
+let gen_func_ir_internal (ana: Semantic.analysis_result) (f: func_def) : ir list =
+  (* 1. Stack Size Calculation (no changes here) *)
+  let num_local_decls = List.assoc f.fname ana.local_var_counts in
+  let num_temps = 6 in (* Max temp registers t0-t5 for expression evaluation *)
+  let required_stack = 8 (* for ra, fp *) + (List.length f.params * 4) + (num_local_decls * 4) + (num_temps * 4) in
+  let stack_size = if required_stack mod 16 == 0 then required_stack else required_stack + (16 - required_stack mod 16) in
+
+  (* 2. [REVISED] Parameter and Environment Setup *)
+  let param_offset = ref (-8) in (* Start allocating param save slots right after saved fp *)
+
+  (* Use List.mapi for a direct and robust mapping of params to registers and stack slots.
+     The i-th parameter in the list naturally corresponds to the 'ai' register. *)
+  let params_with_offsets =
+    List.mapi (fun i name ->
+      let offset = !param_offset in
+      param_offset := !param_offset - 4;
+      (name, offset, Reg ("a" ^ string_of_int i))
+    ) f.params
+  in
+
+  let param_map = List.fold_left (fun acc (name, offset, _) -> VarEnv.add name offset acc) VarEnv.empty params_with_offsets in
+
+  let env = {
+    funcs = ana.global_funcs;
+    vars = ref [param_map]; (* Initialize scope stack with parameters *)
+    stack_top = !param_offset; (* Local variables will be allocated after parameters *)
+    temp_counter = 0;
+    label_counter = 0;
+  } in
+
+  (* 3. [REVISED] Create IR to save incoming parameters (a0-a7) to their stack slots *)
+  (* The original `filteri` was correct, but this is slightly cleaner.
+     We only save parameters that are passed in registers. *)
+  let params_save_ir =
+    params_with_offsets
+    |> List.filter (fun (_, _, reg) ->
+        let reg_name = match reg with Reg s -> s | _ -> "" in
+        String.length reg_name = 2 && reg_name.[0] = 'a')
+    |> List.map (fun (_, offset, reg) -> Store (reg, Stack offset))
+  in
+
+  (* 4. Body Generation and Final Assembly (no changes here) *)
+  let body_ir = List.concat_map (gen_stmt_ir_internal env) f.body in
   [Prologue (f.fname, stack_size)] @ params_save_ir @ body_ir @ [Epilogue (f.fname, stack_size)]
 (*******************************************************************
  * 3. 从 IR 到 RISC-V 汇编的转换 (内部函数)
