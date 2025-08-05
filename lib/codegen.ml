@@ -603,7 +603,7 @@ let gen_func_ir_internal (ana: Semantic.analysis_result) (f: func_def) : ir list
 
   let body_ir = List.concat_map (gen_stmt_ir_internal env) f.body in
 
-  [Prologue (f.fname, stack_size)] @ params_save_ir @ body_ir @ [Epilogue (f.fname, stack_size)] *)
+  [Prologue (f.fname, stack_size)] @ params_save_ir @ body_ir @ [Epilogue (f.fname, stack_size)] 
 
  
 (*******************************************************************
