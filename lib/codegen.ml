@@ -66,6 +66,11 @@ let fresh_label env pfx =
   env.label_counter <- env.label_counter + 1;
   label_name
 
+(* 在栈上为临时计算结果分配空间 *)
+let alloc_temp_stack_slot env =
+  env.stack_top <- env.stack_top - 4;
+  Stack env.stack_top
+
 (* 将 Ast 操作符转换为内部 IR 操作符的辅助函数 *)
 let binop_from_ast_op op =
   match op with
@@ -98,51 +103,48 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       let expr_ir, expr_op = gen_expr_ir_internal env expr in
       let dest_reg = fresh_temp_reg env in
       expr_ir @ [UnOp (unop_from_ast_op op, dest_reg, expr_op)], dest_reg
-  | BinOp (op, e1, e2) when List.mem op [Add; Sub; Mul; Div; Mod] ->
-      let ir1, op1 = gen_expr_ir_internal env e1 in
-      let ir2, op2 = gen_expr_ir_internal env e2 in
-      let dest_reg = fresh_temp_reg env in
-      ir1 @ ir2 @ [BinOp (binop_from_ast_op op, dest_reg, op1, op2)], dest_reg
-  | BinOp (op, e1, e2) when List.mem op [Eq; Neq; Lt; Le; Gt; Ge] ->
-      let ir1, op1 = gen_expr_ir_internal env e1 in
-      let ir2, op2 = gen_expr_ir_internal env e2 in
-      let dest_reg = fresh_temp_reg env in
-      let true_label = fresh_label env "L_true_" in
-      let end_label = fresh_label env "L_end_" in
-      ir1 @ ir2 @ [
-        Li (dest_reg, 0);
-        Branch (binop_from_ast_op op, op1, op2, true_label);
-        Jump end_label;
-        Label true_label;
-        Li (dest_reg, 1);
-        Label end_label;
-      ], dest_reg
-  | BinOp (And, e1, e2) ->
-      let dest_reg = fresh_temp_reg env in
-      let false_label = fresh_label env "L_false_" in
-      let end_label = fresh_label env "L_end_" in
-      let ir1, op1 = gen_expr_ir_internal env e1 in
-      let ir2, op2 = gen_expr_ir_internal env e2 in
-      ir1 @
-      [BranchZ (op1, false_label)] @
-      ir2 @
-      [BranchZ (op2, false_label)] @
-      [Li (dest_reg, 1); Jump end_label;] @
-      [Label false_label; Li (dest_reg, 0);] @
-      [Label end_label], dest_reg
-  | BinOp (Or, e1, e2) ->
-      let dest_reg = fresh_temp_reg env in
-      let true_label = fresh_label env "L_true_" in
-      let end_label = fresh_label env "L_end_" in
-      let ir1, op1 = gen_expr_ir_internal env e1 in
-      let ir2, op2 = gen_expr_ir_internal env e2 in
-      ir1 @
-      [BranchNZ (op1, true_label)] @
-      ir2 @
-      [BranchNZ (op2, true_label)] @
-      [Li (dest_reg, 0); Jump end_label;] @
-      [Label true_label; Li (dest_reg, 1);] @
-      [Label end_label], dest_reg
+  | BinOp (op, e1, e2) ->
+      (match op with
+      | And ->
+          let dest_reg = fresh_temp_reg env in
+          let false_label = fresh_label env "L_false_" in
+          let end_label = fresh_label env "L_end_" in
+          let ir1, op1 = gen_expr_ir_internal env e1 in
+          env.temp_counter <- 0; (* Reset for e2 *)
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
+          [Li(dest_reg, 1); Jump(end_label); Label(false_label); Li(dest_reg, 0); Label(end_label)], dest_reg
+      | Or ->
+          let dest_reg = fresh_temp_reg env in
+          let true_label = fresh_label env "L_true_" in
+          let end_label = fresh_label env "L_end_" in
+          let ir1, op1 = gen_expr_ir_internal env e1 in
+          env.temp_counter <- 0; (* Reset for e2 *)
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
+          [Li(dest_reg, 0); Jump(end_label); Label(true_label); Li(dest_reg, 1); Label(end_label)], dest_reg
+      | _ ->
+          (* Robust strategy: evaluate right, spill, evaluate left, load, compute *)
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          let temp_slot = alloc_temp_stack_slot env in
+          let save_ir = [Store(op2, temp_slot)] in
+          env.temp_counter <- 0;
+          let ir1, op1 = gen_expr_ir_internal env e1 in
+          let loaded_op2 = fresh_temp_reg env in
+          let load_ir = [Load(loaded_op2, temp_slot)] in
+          let dest_reg = fresh_temp_reg env in
+          let final_op = binop_from_ast_op op in
+          (match final_op with
+          | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
+              let true_label = fresh_label env "L_true_" in
+              let end_label = fresh_label env "L_end_" in
+              ir2 @ save_ir @ ir1 @ load_ir @
+              [Li(dest_reg, 0); Branch(final_op, op1, loaded_op2, true_label); Jump(end_label);
+               Label(true_label); Li(dest_reg, 1); Label(end_label)], dest_reg
+          | _ ->
+              ir2 @ save_ir @ ir1 @ load_ir @ [BinOp(final_op, dest_reg, op1, loaded_op2)], dest_reg
+          )
+      )
   | Call (fname, args) ->
       let args_code_and_ops = List.map (gen_expr_ir_internal env) args in
       let args_code = List.concat_map fst args_code_and_ops in
@@ -161,7 +163,6 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
   | _ -> failwith "Unsupported expression type in codegen"
 
 and gen_stmt_ir_internal env ?break_lbl ?cont_lbl (s: stmt) : ir list =
-
   env.temp_counter <- 0;
   match s with
   | Expr e -> fst (gen_expr_ir_internal env e)
@@ -197,7 +198,7 @@ and gen_stmt_ir_internal env ?break_lbl ?cont_lbl (s: stmt) : ir list =
 
 let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
   let locals_map = List.assoc f.fname ana.local_vars in
-  let stack_offset = ref 0 in
+  let stack_offset = ref (-8) in
   let assign_offset () = stack_offset := !stack_offset - 4; !stack_offset in
   let params_with_offsets =
     List.mapi (fun i name ->
@@ -234,7 +235,6 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
   | Li (dest, imm) -> [Printf.sprintf "  li %s, %d" (op_to_str dest) imm]
   | Move (dest, src) -> [Printf.sprintf "  mv %s, %s" (op_to_str dest) (op_to_str src)]
   | Load (dest, src) -> [Printf.sprintf "  lw %s, %s" (op_to_str dest) (op_to_str src)]
-   (* **FIX**: All local variable stores must be relative to fp, not sp *)
   | Store (src, Stack i) when i < 0 -> [Printf.sprintf "  sw %s, %d(fp)" (op_to_str src) i]
   | Store (src, Stack i) -> [Printf.sprintf "  sw %s, %d(sp)" (op_to_str src) i]
   | Store (src, dest) -> [Printf.sprintf "  sw %s, %s" (op_to_str src) (op_to_str dest)]
@@ -269,7 +269,7 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
         Printf.sprintf "  sw fp, %d(sp)" (stack_size - 8);
         Printf.sprintf "  addi fp, sp, %d" stack_size; ]
   | Epilogue (fname, stack_size) ->
-      [ "L_ret_" ^ fname ^ ":";
+      [ ".L_ret_" ^ fname ^ ":";
         Printf.sprintf "  lw fp, %d(sp)" (stack_size - 8);
         Printf.sprintf "  lw ra, %d(sp)" (stack_size - 4);
         Printf.sprintf "  addi sp, sp, %d" stack_size;
@@ -322,7 +322,7 @@ let gen_assembly (ir_code: ir list) : string list =
     | Prologue (fname, _) -> current_fname := fname
     | Epilogue (fname, _) -> current_fname := fname
     | _ -> ());
-    if ir = Ret then [Printf.sprintf "  j L_ret_%s" !current_fname]
+    if ir = Ret then [Printf.sprintf "  j .L_ret_%s" !current_fname]
     else ir_to_asm_list_internal ir
   in
   List.concat_map convert_ir_to_asm ir_code
