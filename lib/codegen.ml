@@ -160,7 +160,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       let temp_ret_reg = fresh_temp_reg env in
       let call_ir = [Call (fname, num_stack_args); Move (temp_ret_reg, ret_reg)] in
       args_code @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_reg
-  | _ -> failwith "Unsupported expression type in codegen"
+ (* | _ -> failwith "Unsupported expression type in codegen"*)
 
 and gen_stmt_ir_internal env ?break_lbl ?cont_lbl (s: stmt) : ir list =
   env.temp_counter <- 0;
