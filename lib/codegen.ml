@@ -161,7 +161,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
   | _ -> failwith "Unsupported expression type in codegen"
 
 and gen_stmt_ir_internal env ?break_lbl ?cont_lbl (s: stmt) : ir list =
-  (* **FIX**: Reset temporary register counter for each new statement *)
+
   env.temp_counter <- 0;
   match s with
   | Expr e -> fst (gen_expr_ir_internal env e)
@@ -234,6 +234,8 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
   | Li (dest, imm) -> [Printf.sprintf "  li %s, %d" (op_to_str dest) imm]
   | Move (dest, src) -> [Printf.sprintf "  mv %s, %s" (op_to_str dest) (op_to_str src)]
   | Load (dest, src) -> [Printf.sprintf "  lw %s, %s" (op_to_str dest) (op_to_str src)]
+   (* **FIX**: All local variable stores must be relative to fp, not sp *)
+  | Store (src, Stack i) when i < 0 -> [Printf.sprintf "  sw %s, %d(fp)" (op_to_str src) i]
   | Store (src, Stack i) -> [Printf.sprintf "  sw %s, %d(sp)" (op_to_str src) i]
   | Store (src, dest) -> [Printf.sprintf "  sw %s, %s" (op_to_str src) (op_to_str dest)]
   | Jump s -> [Printf.sprintf "  j %s" s]
