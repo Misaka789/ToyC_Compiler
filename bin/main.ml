@@ -46,18 +46,24 @@ let () =
 
 (* bin/main.ml - Debugging version *)
 open Toyc_compiler_lib
+let read_stdin_all () =
+  let buf = Buffer.create 4096 in
+  try
+    while true do
+      Buffer.add_string buf (input_line stdin);
+      Buffer.add_char buf '\n'
+    done;
+    Buffer.contents buf
+  with End_of_file ->
+    Buffer.contents buf
 
 let () =
-  (* 从标准输入读取整个源代码 *)
-  let source_code = really_input_string stdin (in_channel_length stdin) in
+  let source_code = read_stdin_all () in
   let lexbuf = Lexing.from_string source_code in
   try
     let ast = Parser.program Lexer.token lexbuf in
-    (* 生成 IR *)
     let ir_code = Codegen.gen_program ast in
-    (* 生成汇编 *)
     let assembly = Codegen.gen_assembly ir_code in
-    (* 输出汇编到标准输出 *)
     List.iter print_endline assembly
   with
   | Toyc_compiler_lib.Lexer.Error msg ->
@@ -66,7 +72,6 @@ let () =
       prerr_endline ("Unexpected error: " ^ Printexc.to_string e);
       Printexc.print_backtrace stderr;
       exit 1
-
 
 
 
