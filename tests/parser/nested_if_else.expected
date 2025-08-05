@@ -1,1 +1,0 @@
-[FuncDef(name=main, params=[], body=Block([If(BinOp(Gt, Id(a), Id(b)), If(BinOp(Gt, Id(c), Id(d)), Return(Some(Int(1))), Some(Return(Some(Int(2))))), None); Return(Some(Int(3)))]))]

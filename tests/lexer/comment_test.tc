@@ -1,8 +1,0 @@
-int main() {
-  /*
-    This is a comment.
-    It contains a fake end token:  * /  (with a space)
-    It also contains fake code: if (a > b) return;
-  */
-  return /* inline comment */ 1;
-}

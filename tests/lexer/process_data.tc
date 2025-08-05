@@ -1,7 +1,0 @@
-int process_data_1(int input_val) {
-    if (input_val >= 100 && input_val != 200) {
-        return (input_val % 10) * -1; 
-    } else {
-        return 0;
-    }
-}

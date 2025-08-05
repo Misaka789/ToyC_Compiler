@@ -1,1 +1,0 @@
-[FuncDef(name=main, params=[], body=Block([Return(Some(BinOp(Or, BinOp(And, BinOp(Eq, BinOp(Add, Int(1), BinOp(Mul, Int(2), Int(3))), Int(7)), BinOp(Gt, BinOp(Div, Int(10), Int(5)), Int(1))), UnOp(Not, Int(0)))))]))]
