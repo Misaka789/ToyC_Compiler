@@ -813,10 +813,22 @@ let reg_name = "t" ^ string_of_int env.temp_counter in
 Reg reg_name
 
 (* 创建一个新的标签 *)
-let fresh_label env pfx =
+(* let fresh_label env pfx =
   let label_name = pfx ^ string_of_int env.label_counter in
   env.label_counter <- env.label_counter + 1;
-label_name
+label_name *)
+let fresh_label env pfx =
+  let current_func = 
+    match env.vars with 
+    | scope::_ -> 
+        (match VarEnv.find_opt "__current_func" scope with 
+         | Some _ -> "func_" ^ (string_of_int (VarEnv.find "__current_func" scope)) ^ "_"
+         | None -> "")
+    | [] -> "" 
+  in
+  let label_name = current_func ^ pfx ^ string_of_int env.label_counter in
+  env.label_counter <- env.label_counter + 1;
+  label_name
 
 (* 在栈上为临时计算结果分配空间 *)
 let alloc_temp_stack_slot env =
