@@ -119,7 +119,9 @@ let analyze_program (p: program) : analysis_result =
   { global_funcs; local_var_counts } *)
 
 
-  open Ast
+
+(* lib/semantic.ml *)
+open Ast
 
 (* 符号表类型 *)
 module VarEnv = Map.Make(String)
@@ -147,9 +149,6 @@ let build_func_env (funcs: func_def list) : func_sig FuncEnv.t =
 
 (*******************************************************************
  * MODIFIED: analyze_local_vars
- * REASON: The original implementation flattened all scopes. This new
- * version uses a stack of scopes (a list of StringSets) to correctly
- * check for duplicate definitions only within the *same* block.
  *******************************************************************)
 let analyze_local_vars (f: func_def) : typ VarEnv.t =
   (* 参数名集合 *)
