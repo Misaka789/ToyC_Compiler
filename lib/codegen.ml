@@ -949,7 +949,7 @@ Move (temp_ret_reg, ret_reg)] in
 
 (* `gen_stmt_ir_internal` and `gen_stmts_ir_internal` are mutually recursive,
  * so they must be defined together in a single `let rec ... and ...` block. *)
-let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
+(* let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
   let temp_reset_env = { env with temp_counter = 0 } in
   match s with
   | Expr e ->
@@ -1006,6 +1006,78 @@ let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir l
       (* The loop body is a self-contained scope. *)
       let (body_ir, _) = gen_stmt_ir_internal temp_reset_env ~break_lbl:end_label ~cont_lbl:start_label body in
       ([Label start_label] @ cond_ir @ [BranchZ (cond_op, end_label)] @ body_ir @ [Jump start_label; Label end_label], env)
+  | Break -> (match break_lbl with Some lbl -> ([Jump lbl], env) | None -> failwith "break statement not within a loop")
+  | Continue -> (match cont_lbl with Some lbl -> ([Jump lbl], env) | None -> failwith "continue statement not within a loop") *)
+
+
+
+
+let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
+  (*
+   * MODIFIED: Do not create a copy of the environment.
+   * REASON: Creating a copy (`{ env with ... }`) caused the mutable `label_counter`
+   * to be reset to an earlier value during recursive calls, leading to duplicate labels.
+   * Instead, we now directly mutate the `temp_counter` on the environment that is
+   * passed through the entire compilation of a function.
+   *)
+  env.temp_counter <- 0;
+
+  match s with
+  | Expr e ->
+      let (ir, _) = gen_expr_ir_internal env e in
+      (ir, env) (* The environment does not change for an expression statement. *)
+
+  | Return None -> ([Ret], env)
+  | Return (Some e) ->
+      let (ir, op) = gen_expr_ir_internal env e in
+      (ir @ [Move (Reg "a0", op); Ret], env)
+
+  | VarDecl (id, init_e) ->
+      (* 1. Generate IR for the initializer using the CURRENT environment. *)
+      let (init_ir, op) = gen_expr_ir_internal env init_e in
+
+      (* 2. Allocate stack space for the new variable. *)
+      env.stack_top := !(env.stack_top) - 4;
+      let var_loc = !(env.stack_top) in
+
+      (* 3. Create the store instruction. *)
+      let store_ir = [Store (op, Stack var_loc)] in
+
+      (* 4. Create the NEW environment for subsequent statements by updating the vars list. *)
+      let new_current_scope = VarEnv.add id var_loc (List.hd env.vars) in
+      let new_env = { env with vars = new_current_scope :: (List.tl env.vars) } in
+
+      (init_ir @ store_ir, new_env) (* Return the IR and the MODIFIED environment. *)
+
+  | Block stmts ->
+      (* 1. Enter a new scope by pushing an empty var map. *)
+      let block_env = { env with vars = VarEnv.empty :: env.vars } in
+      (* 2. Process the statements within the new scope. *)
+      let (block_ir, _) = gen_stmts_ir_internal block_env ?break_lbl ?cont_lbl stmts in
+      (* 3. Exit the scope by returning the original environment. *)
+      (block_ir, env)
+
+  | If (cond, then_s, else_s_opt) ->
+      (* All sub-expressions and statements will now use the same `env` instance,
+         ensuring the label_counter is correctly incremented and never reset. *)
+      let (cond_ir, cond_op) = gen_expr_ir_internal env cond in
+      let else_label = fresh_label env "L_else_" in
+      let end_label = fresh_label env "L_end_" in
+      let (then_ir, _) = gen_stmt_ir_internal env ?break_lbl ?cont_lbl then_s in
+      (match else_s_opt with
+      | None ->
+          (cond_ir @ [BranchZ (cond_op, end_label)] @ then_ir @ [Label end_label], env)
+      | Some else_s ->
+          let (else_ir, _) = gen_stmt_ir_internal env ?break_lbl ?cont_lbl else_s in
+          (cond_ir @ [BranchZ (cond_op, else_label)] @ then_ir @ [Jump end_label; Label else_label] @ else_ir @ [Label end_label], env)
+      )
+  | While (cond, body) ->
+      let start_label = fresh_label env "L_while_start_" in
+      let end_label = fresh_label env "L_while_end_" in
+      let (cond_ir, cond_op) = gen_expr_ir_internal env cond in
+      let (body_ir, _) = gen_stmt_ir_internal env ~break_lbl:end_label ~cont_lbl:start_label body in
+      ([Label start_label] @ cond_ir @ [BranchZ (cond_op, end_label)] @ body_ir @ [Jump start_label; Label end_label], env)
+
   | Break -> (match break_lbl with Some lbl -> ([Jump lbl], env) | None -> failwith "break statement not within a loop")
   | Continue -> (match cont_lbl with Some lbl -> ([Jump lbl], env) | None -> failwith "continue statement not within a loop")
 
