@@ -791,6 +791,7 @@ type cg_env = {
   stack_top: int ref;      (* Mutable stack offset counter *)
   mutable temp_counter: int;
   mutable label_counter: int;
+  current_function_name: string; (* NEW: Store the current function's name *)
 }
 
 (* 在作用域栈中查找变量 *)
@@ -818,15 +819,7 @@ Reg reg_name
   env.label_counter <- env.label_counter + 1;
 label_name *)
 let fresh_label env pfx =
-  let current_func = 
-    match env.vars with 
-    | scope::_ -> 
-        (match VarEnv.find_opt "__current_func" scope with 
-         | Some _ -> "func_" ^ (string_of_int (VarEnv.find "__current_func" scope)) ^ "_"
-         | None -> "")
-    | [] -> "" 
-  in
-  let label_name = current_func ^ pfx ^ string_of_int env.label_counter in
+  let label_name = Printf.sprintf "%s_%s%d" env.current_function_name pfx env.label_counter in
   env.label_counter <- env.label_counter + 1;
   label_name
 
@@ -1049,6 +1042,7 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
     stack_top = ref !param_offset;
     temp_counter = 0;
     label_counter = 0;
+    current_function_name = f.fname; (* INITIALIZE HERE *)
 } in
 
   (* 3. Generate the IR for the function body using the new helper. *)
