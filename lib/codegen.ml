@@ -112,8 +112,8 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
   (* The main recursive generation function *)
   let gen_and_spill e =
     let ir, op = gen_expr_ir_internal env e in
-    (* 对任何复杂表达式，始终将其最终结果转存到栈上新的临时槽位中。
-    防止寄存器被同级表达式破坏*)
+    (* 对任何复杂表达式，将其最终结果转存到栈上的新的临时槽位中。
+    防止寄存器被同级表达式破坏 *)
     let temp_slot = alloc_temp_stack_slot env in
     let spill_ir = [Store(op, temp_slot)] in
     (ir @ spill_ir, temp_slot)
@@ -234,16 +234,34 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
 
       (* The rest of the Call logic now works with guaranteed-safe locations *)
       let reg_arg_locs, stack_arg_locs =
-        let rec split n lst = (* ... as before ... *) in split 8 arg_locs
+        let rec split n lst = 
+          if n <= 0 then ([], lst)
+          else match lst with
+          | [] -> ([], [])
+          | h :: t -> let (taken, rest) = split (n - 1) t in (h :: taken, rest)
+        in split 8 arg_locs
       in
       let num_stack_args = List.length stack_arg_locs in
       let stack_space_for_args = num_stack_args * 4 in
+
       let pre_call_ir = [PreCall stack_space_for_args] in
-      let stack_passing_ir = (* ... as before ... *) in
-      let reg_passing_ir = (* ... as before ... *) in
-      
-      (* The final result of the call must ALSO be spilled to be safe *)
-      let temp_ret_reg = Reg "a0" in
+
+      let stack_passing_ir =
+        List.concat (
+          List.mapi (fun i loc ->
+            [ Load (Reg "t6", loc);
+              StoreOutArg (Reg "t6", i * 4) ]
+          ) stack_arg_locs
+        )
+      in
+
+      let reg_passing_ir =
+        List.mapi (fun i loc ->
+          Load (Reg ("a" ^ string_of_int i), loc)
+        ) reg_arg_locs
+      in
+
+     let temp_ret_reg = Reg "a0" in
       let final_slot = alloc_temp_stack_slot env in
       let call_cleanup_ir = [
         Call fname;
@@ -253,6 +271,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
 
       let full_ir = eval_ir @ pre_call_ir @ stack_passing_ir @ reg_passing_ir @ call_cleanup_ir in
       (full_ir, final_slot)
+  
 (* _ -> failwith "Unsupported expression type in codegen" *)
 
 
