@@ -131,32 +131,67 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let dest_op = fresh_temp env in
           let false_label = fresh_label env "L_false_" in
           let end_label = fresh_label env "L_end_" in
+          
+          (* Save state before evaluating sub-expressions *)
+          let saved_temp_counter = !(env.temp_counter) in
+          let saved_stack_top = !(env.stack_top) in
+
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0;
+          
+          (* Restore state for the evaluation of the second sub-expression *)
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+          
           let ir2, op2 = gen_expr_ir_internal env e2 in
+          
+          (* Restore state after all sub-expressions are done *)
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+
           ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
           [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
       | Or ->
           let dest_op = fresh_temp env in
           let true_label = fresh_label env "L_true_" in
           let end_label = fresh_label env "L_end_" in
+          
+          let saved_temp_counter = !(env.temp_counter) in
+          let saved_stack_top = !(env.stack_top) in
+
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0;
+          
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+          
           let ir2, op2 = gen_expr_ir_internal env e2 in
+
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+          
           ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
           [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
       
-      (* The robust "Spill-and-Reload" strategy, but this time with a correct assembler *)
       | _ ->
-          (* This order of evaluation (e1 then e2) is more conventional *)
+          (* The robust "Spill-and-Reload" strategy with proper state isolation *)
+          let saved_temp_counter = !(env.temp_counter) in
+          let saved_stack_top = !(env.stack_top) in
+
           let ir1, op1 = gen_expr_ir_internal env e1 in
+          
+          (* The temporary slot for op1 must be allocated *after* e1 is fully evaluated *)
           let temp_slot_for_op1 = alloc_temp_stack_slot env in
           let save_ir = [Store(op1, temp_slot_for_op1)] in
-          
-          env.temp_counter := 0; (* Reset temps for the other side *)
-          
+
+          (* Restore state completely before evaluating e2 *)
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+
           let ir2, op2 = gen_expr_ir_internal env e2 in
           
+          (* Restore state after e2 is done, before allocating final temps *)
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+
           let loaded_op1 = fresh_temp env in
           let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
           
@@ -180,11 +215,18 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
               full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
           )
       )
-| Call (fname, args) ->
-      (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
+
+  | Call (fname, args) ->
+      (* Evaluate arguments in isolated environments *)
+      let saved_temp_counter = !(env.temp_counter) in
+      let saved_stack_top = !(env.stack_top) in
+      
       let (eval_ir, arg_spill_locs_rev) =
         List.fold_left (fun (acc_ir, acc_locs) arg_expr ->
-          env.temp_counter := 0;
+          (* Restore state for EACH argument *)
+          env.temp_counter := saved_temp_counter;
+          env.stack_top := saved_stack_top;
+          
           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
           let spill_slot = alloc_temp_stack_slot env in
           let spill_ir = [Store (arg_op, spill_slot)] in
@@ -193,45 +235,38 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       in
       let arg_locs = List.rev arg_spill_locs_rev in
 
-      (* 步骤 2: 区分需要通过寄存器和栈传递的参数 *)
+      (* Restore state after all arguments are evaluated and spilled *)
+      env.temp_counter := saved_temp_counter;
+      env.stack_top := saved_stack_top;
+
       let reg_arg_locs, stack_arg_locs =
         let rec split n lst =
-            if n <= 0 then ([], lst)
-            else
-            match lst with
-            | [] -> ([], [])
-            | h :: t ->
-                let (taken, rest) = split (n - 1) t in
-                (h :: taken, rest)
-          in
-          split 8 arg_locs
+          if n <= 0 then ([], lst)
+          else match lst with
+          | [] -> ([], [])
+          | h :: t -> let (taken, rest) = split (n - 1) t in (h :: taken, rest)
+        in split 8 arg_locs
       in
       let num_stack_args = List.length stack_arg_locs in
       let stack_space_for_args = num_stack_args * 4 in
 
-      (* 步骤 3: 按照 ABI 顺序生成 IR *)
-      (* 3.1: (PreCall) 先为出参分配栈空间 *)
       let pre_call_ir = [PreCall stack_space_for_args] in
 
-      (* 3.2: (Store) 将需要通过栈传递的参数，从其临时位置加载并存入刚分配的出参栈空间 (sp-relative) *)
       let stack_passing_ir =
         List.concat (
           List.mapi (fun i loc ->
-            (* 使用 t6 作为中转寄存器 *)
             [ Load (Reg "t6", loc);
-              StoreOutArg (Reg "t6", i * 4) ] (* MODIFIED: Use new IR node *)
+              StoreOutArg (Reg "t6", i * 4) ]
           ) stack_arg_locs
         )
       in
 
-      (* 3.3: (Load) 将需要通过寄存器传递的参数，从其临时位置加载到 a0-a7 *)
       let reg_passing_ir =
         List.mapi (fun i loc ->
           Load (Reg ("a" ^ string_of_int i), loc)
         ) reg_arg_locs
       in
 
-      (* 3.4: (Call) 生成真正的调用指令，以及后续清理和返回值处理 *)
       let temp_ret_op = fresh_temp env in
       let call_cleanup_ir = [
         Call fname;
@@ -239,8 +274,6 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
         Move (temp_ret_op, Reg "a0")
       ] in
 
-      (* 最终的 IR 顺序:
-         求值 -> 准备调用栈 -> 传递栈参数 -> 传递寄存器参数 -> 调用和清理 *)
       let full_ir = eval_ir @ pre_call_ir @ stack_passing_ir @ reg_passing_ir @ call_cleanup_ir in
       (full_ir, temp_ret_op)
   
@@ -248,7 +281,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
 
 
 let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
-  env.temp_counter := 0; (* MODIFIED *)
+   (*env.temp_counter := 0; 语句层面的强制重置不再必要*)
 
   match s with
   | Expr e ->
