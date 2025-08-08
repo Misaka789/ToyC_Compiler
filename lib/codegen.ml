@@ -50,8 +50,8 @@ type cg_env = {
   funcs: func_sig FuncEnv.t;
   vars: int VarEnv.t list; (* A stack of scopes，变成list存储不同作用域 *)
   stack_top: int ref;      
-  mutable temp_counter: int;
-  mutable label_counter: int;
+   temp_counter: int ref;        (* MODIFIED *)
+  label_counter: int ref;       (* MODIFIED *)
   current_function_name: string; (* NEW: Store the current function's name，用于label命名 *)
 }
 
@@ -73,21 +73,20 @@ let alloc_temp_stack_slot env =
 Stack !(env.stack_top)
 
 (* 创建一个新的临时操作数。优先使用寄存器 (t0-t5)，用尽后在栈上分配空间 *)
-let fresh_temp_reg env =
-  if env.temp_counter < 6 then (
-    let reg_name = "t" ^ string_of_int env.temp_counter in
-    env.temp_counter <- env.temp_counter + 1;
+let fresh_temp env = (* Renamed from fresh_temp for clarity *)
+  if !(env.temp_counter) < 6 then (
+    let reg_name = "t" ^ string_of_int !(env.temp_counter) in
+    env.temp_counter := !(env.temp_counter) + 1;
     Reg reg_name
   ) else (
     alloc_temp_stack_slot env
   )
 
-(* 创建一个新的标签，加上函数名前缀 *)
+(* 创建一个新的标签 *)
 let fresh_label env pfx =
-  let label_name = Printf.sprintf "%s_%s%d" env.current_function_name pfx env.label_counter in
-  env.label_counter <- env.label_counter + 1;
+  let label_name = Printf.sprintf "%s_%s%d" env.current_function_name pfx !(env.label_counter) in
+  env.label_counter := !(env.label_counter) + 1;
   label_name
-
 
 
 (* 将 Ast 操作符转换为内部 IR 操作符的辅助函数 *)
@@ -108,11 +107,11 @@ let unop_from_ast_op op =
 let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
   match e with
   | IntLiteral n ->
-      let temp_reg = fresh_temp_reg env in
+      let temp_reg = fresh_temp env in
       [Li (temp_reg, n)], temp_reg
   | Id x ->
       let var_loc = find_var_offset env x in
-      let temp_reg = fresh_temp_reg env in
+      let temp_reg = fresh_temp env in
       [Load (temp_reg, Stack var_loc)], temp_reg
   | Assign (x, rhs_expr) ->
       let rhs_ir, rhs_op = gen_expr_ir_internal env rhs_expr in
@@ -120,25 +119,25 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       rhs_ir @ [Store (rhs_op, Stack var_loc)], rhs_op
   | UnOp (op, expr) ->
       let expr_ir, expr_op = gen_expr_ir_internal env expr in
-      let dest_reg = fresh_temp_reg env in
+      let dest_reg = fresh_temp env in
       expr_ir @ [UnOp (unop_from_ast_op op, dest_reg, expr_op)], dest_reg
   | BinOp (op, e1, e2) ->
       (match op with
       | And ->
-          let dest_reg = fresh_temp_reg env in
+          let dest_reg = fresh_temp env in
           let false_label = fresh_label env "L_false_" in
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter <- 0; (* Reset for e2 *)
+           env.temp_counter := 0; (* MODIFIED *)
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
           [Li(dest_reg, 1); Jump(end_label); Label(false_label); Li(dest_reg, 0); Label(end_label)], dest_reg
       | Or ->
-          let dest_reg = fresh_temp_reg env in
+          let dest_reg = fresh_temp env in
           let true_label = fresh_label env "L_true_" in     
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter <- 0; (* Reset for e2 *)
+          env.temp_counter := 0; (* MODIFIED *)
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
           [Li(dest_reg, 0); Jump(end_label); Label(true_label); Li(dest_reg, 1); Label(end_label)], dest_reg
@@ -147,11 +146,11 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let ir2, op2 = gen_expr_ir_internal env e2 in
           let temp_slot = alloc_temp_stack_slot env in
           let save_ir = [Store(op2, temp_slot)] in
-          env.temp_counter <- 0;
+          env.temp_counter := 0; (* MODIFIED *)
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          let loaded_op2 = fresh_temp_reg env in
+          let loaded_op2 = fresh_temp env in
           let load_ir = [Load(loaded_op2, temp_slot)] in
-          let dest_reg = fresh_temp_reg env in
+          let dest_reg = fresh_temp env in
           let final_op = binop_from_ast_op op in
           (match final_op with
           | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt |  IR_Ge ->
@@ -176,7 +175,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       let stack_passing_ir = List.mapi (fun i op -> Store (op, Stack (i * -4))) (List.rev stack_args) in
       let num_stack_args = List.length stack_args in      
       let ret_reg = Reg "a0" in
-      let temp_ret_reg = fresh_temp_reg env in
+      let temp_ret_reg = fresh_temp env in
       let call_ir = [Call (fname, num_stack_args);
 Move (temp_ret_reg, ret_reg)] in
       args_code @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_reg
@@ -184,7 +183,7 @@ Move (temp_ret_reg, ret_reg)] in
 
 
 let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
-  env.temp_counter <- 0; (* MODIFIED: Do not create a copy of the environment.  *)
+  env.temp_counter := 0; (* MODIFIED *)
 
   match s with
   | Expr e ->
@@ -275,8 +274,8 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
   funcs = ana.global_funcs;
     vars = [initial_var_map]; (* Start with one scope for parameters *)
     stack_top = ref !param_offset;
-    temp_counter = 0;
-    label_counter = 0;
+    temp_counter = ref 0;        (* MODIFIED *)
+    label_counter = ref 0;       (* MODIFIED *)
     current_function_name = f.fname; (* INITIALIZE HERE *)
 } in
 
@@ -299,19 +298,28 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
 (*******************************************************************
  * 3. 从 IR 到 RISC-V 汇编的转换 (内部函数)
  *******************************************************************)
-(* This section remains unchanged *)
-(* lib/codegen.ml, in Section 3 *)
-
-(* lib/codegen.ml, in Section 3 -- 完整替换 *)
 
 let ir_to_asm_list_internal (ir_instr: ir) : string list =
+  (* 检查立即数是否在12位有符号范围内 *)
+  let is_small_imm i = i >= -2048 && i <= 2047 in
+
+  (* 辅助函数：智能地处理内存访问，支持大偏移量 *)
+  let emit_mem_access op_str reg_name offset base_reg =
+    if is_small_imm offset then
+      [Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg]
+    else
+      [Printf.sprintf "  li t6, %d" offset;
+       Printf.sprintf "  add t6, %s, t6" base_reg;
+       Printf.sprintf "  %s %s, 0(t6)" op_str reg_name]
+  in
+
   (* 辅助函数: 将任意操作数的值加载到一个指定的暂存寄存器中 *)
   let ensure_in_reg op target_reg =
     match op with
     | Reg s ->
         if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
     | Stack i ->
-        [Printf.sprintf "  lw %s, %d(fp)" target_reg i], target_reg
+        emit_mem_access "lw" target_reg i "fp", target_reg
     | Imm i ->
         [Printf.sprintf "  li %s, %d" target_reg i], target_reg
   in
@@ -322,54 +330,40 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
     | Reg s ->
         if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
     | Stack i ->
-        [Printf.sprintf "  sw %s, %d(fp)" src_reg i]
+        emit_mem_access "sw" src_reg i "fp"
     | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
   in
 
   match ir_instr with
   | Label s -> [s ^ ":"]
-
   | Li (dest, imm) ->
       let load_imm_ir = [Printf.sprintf "  li t6, %d" imm] in
       let store_ir = store_from_reg "t6" dest in
       load_imm_ir @ store_ir
-
   | Move (dest, src) ->
       let load_ir, src_reg_name = ensure_in_reg src "t6" in
       let store_ir = store_from_reg src_reg_name dest in
       load_ir @ store_ir
-
-  (*** FIXED LOGIC FOR Load and Store BELOW ***)
-
   | Load (dest, src) ->
       (match src with
       | Stack i ->
-          (* 正确逻辑: 直接从 src 地址加载值到 t6 *)
-          let load_val_ir = [Printf.sprintf "  lw t6, %d(fp)" i] in
-          (* 然后将 t6 的值存到最终目的地 dest *)
+          let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
           let store_dest_ir = store_from_reg "t6" dest in
           load_val_ir @ store_dest_ir
       | _ -> failwith "FATAL: Source of Load must be a Stack location")
-
   | Store (src, dest) ->
       (match dest with
       | Stack i ->
-          (* 正确逻辑: 先把要存储的值 src 加载到 t6 *)
           let load_src_ir, src_reg = ensure_in_reg src "t6" in
-          (* 然后直接将 t6 的值存储到 dest 地址 *)
-          let store_ir = [Printf.sprintf "  sw %s, %d(fp)" src_reg i] in
+          let store_ir = emit_mem_access "sw" src_reg i "fp" in
           load_src_ir @ store_ir
       | _ -> failwith "FATAL: Destination of Store must be a Stack location")
-
-  (*** END OF FIXED LOGIC ***)
-
   | UnOp (op, dest, src) ->
       let op_str = match op with IR_Neg -> "neg" | IR_Not -> "seqz" in
       let load_ir, src_reg = ensure_in_reg src "t6" in
       let compute_ir = [Printf.sprintf "  %s t6, %s" op_str src_reg] in
       let store_ir = store_from_reg "t6" dest in
       load_ir @ compute_ir @ store_ir
-
   | BinOp (op, dest, src1, src2) ->
       let op_str = match op with | IR_Add -> "add" | IR_Sub -> "sub" | IR_Mul -> "mul" | IR_Div -> "div" | IR_Mod -> "rem" | _ -> failwith "Invalid op for BinOp" in
       let load1_ir, reg1 = ensure_in_reg src1 "t5" in
@@ -377,22 +371,18 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
       let compute_ir = [Printf.sprintf "  %s t5, %s, %s" op_str reg1 reg2] in
       let store_ir = store_from_reg "t5" dest in
       load1_ir @ load2_ir @ compute_ir @ store_ir
-
   | BranchZ (src, label) ->
       let load_ir, reg = ensure_in_reg src "t6" in
       load_ir @ [Printf.sprintf "  beqz %s, %s" reg label]
-
   | BranchNZ (src, label) ->
       let load_ir, reg = ensure_in_reg src "t6" in
       load_ir @ [Printf.sprintf "  bnez %s, %s" reg label]
-
   | Branch (op, src1, src2, label) ->
       let branch_op_str = match op with | IR_Eq -> "beq" | IR_Neq -> "bne" | IR_Lt -> "blt" | IR_Le -> "ble" | IR_Gt -> "bgt" | IR_Ge -> "bge" | _ -> failwith "Invalid op for Branch" in
       let load1_ir, reg1 = ensure_in_reg src1 "t5" in
       let load2_ir, reg2 = ensure_in_reg src2 "t6" in
       let branch_ir = [Printf.sprintf "  %s %s, %s, %s" branch_op_str reg1 reg2 label] in
       load1_ir @ load2_ir @ branch_ir
-
   | Jump s -> [Printf.sprintf "  j %s" s]
   | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
   | Call (s, num_stack_args) ->
@@ -403,17 +393,34 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
          Printf.sprintf "  addi sp, sp, %d" stack_space]
       else [Printf.sprintf "  call %s" s]
   | Prologue (fname, stack_size) ->
-      [ "  .text"; "  .globl " ^ fname; fname ^ ":";
-        Printf.sprintf "  addi sp, sp, -%d" stack_size;
-        Printf.sprintf "  sw ra, %d(sp)" (stack_size - 4);
-        Printf.sprintf "  sw fp, %d(sp)" (stack_size - 8);
-        Printf.sprintf "  addi fp, sp, %d" stack_size; ]
+      let setup_sp =
+        if is_small_imm (-stack_size) then
+          [Printf.sprintf "  addi sp, sp, -%d" stack_size]
+        else
+          [Printf.sprintf "  li t6, %d" stack_size;
+           Printf.sprintf "  sub sp, sp, t6"]
+      in
+      let save_ra = emit_mem_access "sw" "ra" (stack_size - 4) "sp" in
+      let save_fp = emit_mem_access "sw" "fp" (stack_size - 8) "sp" in
+      let setup_fp =
+        if is_small_imm stack_size then
+          [Printf.sprintf "  addi fp, sp, %d" stack_size]
+        else
+          [Printf.sprintf "  li t6, %d" stack_size;
+           Printf.sprintf "  add fp, sp, t6"]
+      in
+      [".text"; ".globl " ^ fname; fname ^ ":"] @ setup_sp @ save_ra @ save_fp @ setup_fp
   | Epilogue (fname, stack_size) ->
-      [ ".L_ret_" ^ fname ^ ":";
-        Printf.sprintf "  lw fp, %d(sp)" (stack_size - 8);
-        Printf.sprintf "  lw ra, %d(sp)" (stack_size - 4);
-        Printf.sprintf "  addi sp, sp, %d" stack_size;
-        "  ret"; ]
+      let restore_fp = emit_mem_access "lw" "fp" (stack_size - 8) "sp" in
+      let restore_ra = emit_mem_access "lw" "ra" (stack_size - 4) "sp" in
+      let teardown_sp =
+        if is_small_imm stack_size then
+          [Printf.sprintf "  addi sp, sp, %d" stack_size]
+        else
+          [Printf.sprintf "  li t6, %d" stack_size;
+           Printf.sprintf "  add sp, sp, t6"]
+      in
+      [".L_ret_" ^ fname ^ ":"] @ restore_fp @ restore_ra @ teardown_sp @ ["  ret"]
 
 (*******************************************************************
  * 4. 公共接口 (Public Interface)
