@@ -35,7 +35,8 @@ type ir =
   | BinOp of ir_binop * operand * operand * operand
   | UnOp of ir_unop * operand * operand
   | Load of operand * operand
-  | Store of operand * operand
+  | Store of operand * operand       (* This now ALWAYS means fp-relative store *)
+  | StoreOutArg of operand * int   (* NEW: Explicitly for sp-relative outgoing args *)
   | Branch of ir_binop * operand * operand * string
   | BranchZ of operand * string
   | BranchNZ of operand * string
@@ -202,8 +203,9 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       let stack_passing_ir =
         List.concat (
           List.mapi (fun i loc ->
+            (* 使用 t6 作为中转寄存器 *)
             [ Load (Reg "t6", loc);
-              Store (Reg "t6", Stack (i * 4)) ]
+              StoreOutArg (Reg "t6", i * 4) ] (* MODIFIED: Use new IR node *)
           ) stack_arg_locs
         )
       in
@@ -359,7 +361,6 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
     if is_small_imm offset then
       [Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg]
     else
-      (* For large offsets, calculate address manually into t6 *)
       [Printf.sprintf "  li t6, %d" offset;
        Printf.sprintf "  add t6, %s, t6" base_reg;
        Printf.sprintf "  %s %s, 0(t6)" op_str reg_name]
@@ -371,7 +372,6 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
     | Reg s ->
         if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
     | Stack i ->
-        (* Local variables, params, and spills are always fp-relative *)
         emit_mem_access "lw" target_reg i "fp", target_reg
     | Imm i ->
         [Printf.sprintf "  li %s, %d" target_reg i], target_reg
@@ -383,7 +383,6 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
     | Reg s ->
         if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
     | Stack i ->
-        (* Local variables, params, and spills are always fp-relative *)
         emit_mem_access "sw" src_reg i "fp"
     | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
   in
@@ -404,20 +403,20 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
           let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
           let store_dest_ir = store_from_reg "t6" dest in
           load_val_ir @ store_dest_ir
-      | _ -> failwith "FATAL: Source of Load must be a Stack location")
-
-  (*** FIXED LOGIC FOR Store BELOW ***)
+      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location")
   | Store (src, dest) ->
       (match dest with
       | Stack i ->
-          (* 正确逻辑: 根据偏移量正负选择基址寄存器 *)
-          let base_reg = if i < 0 then "fp" else "sp" in
+          (* Store is now ONLY for local variables, always fp-relative *)
           let load_src_ir, src_reg = ensure_in_reg src "t6" in
-          let store_ir = emit_mem_access "sw" src_reg i base_reg in
+          let store_ir = emit_mem_access "sw" src_reg i "fp" in
           load_src_ir @ store_ir
-      | _ -> failwith "FATAL: Destination of Store must be a Stack location")
-  (*** END OF FIXED LOGIC ***)
-
+      | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location")
+  | StoreOutArg (src, offset) ->
+      (* StoreOutArg is ONLY for outgoing args, always sp-relative *)
+      let load_src_ir, src_reg = ensure_in_reg src "t6" in
+      let store_ir = emit_mem_access "sw" src_reg offset "sp" in
+      load_src_ir @ store_ir
   | UnOp (op, dest, src) ->
       let op_str = match op with IR_Neg -> "neg" | IR_Not -> "seqz" in
       let load_ir, src_reg = ensure_in_reg src "t6" in
@@ -507,7 +506,8 @@ let string_of_ir (ir_instr: ir) : string =
   | Li (dest, imm) -> Printf.sprintf "  %s = %d" (op_to_str dest) imm
   | Move (dest, src) -> Printf.sprintf "  %s = %s" (op_to_str dest) (op_to_str src)
   | Load (dest, src) -> Printf.sprintf "  %s = *%s" (op_to_str dest) (op_to_str src)
-  | Store (src, dest) -> Printf.sprintf "  *%s = %s" (op_to_str dest) (op_to_str src)
+   | Store (src, dest) -> Printf.sprintf "  *%s = %s" (op_to_str dest) (op_to_str src)
+  | StoreOutArg (src, offset) -> Printf.sprintf "  *(sp + %d) = %s" offset (op_to_str src)
   | Jump s -> Printf.sprintf "  j %s" s
   | PreCall size -> Printf.sprintf "  precall %d" size
   | Call s -> Printf.sprintf "  call %s" s
