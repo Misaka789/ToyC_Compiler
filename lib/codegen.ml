@@ -109,15 +109,14 @@ let unop_from_ast_op op =
 
  (*添加辅助函数*)
  (* Helper to push an operand to the top of the runtime stack *)
-let push_op env op =
-  let push_ir = [StoreOutArg (op, 0)] in (* Use StoreOutArg for sp-relative store *)
-  let adjust_sp_ir = [PreCall 4] in (* Decrement sp by 4 *)
+let push_op _env op =
+  let push_ir = [StoreOutArg (op, 0)] in
+  let adjust_sp_ir = [PreCall 4] in
   push_ir @ adjust_sp_ir
 
-(* Helper to pop from the top of the runtime stack into a register *)
-let pop_op env dest_reg =
-  let adjust_sp_ir = [PostCall 4] in (* Increment sp by 4 *)
-  let pop_ir = [Load (dest_reg, Stack 0)] in (* Load from sp+0 *)
+let pop_op _env dest_reg =
+  let adjust_sp_ir = [PostCall 4] in
+  let pop_ir = [Load (dest_reg, Stack 0)] in
   adjust_sp_ir @ pop_ir
 
 let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
