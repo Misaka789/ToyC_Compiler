@@ -348,37 +348,42 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
  * 3. 从 IR 到 RISC-V 汇编的转换 (内部函数)
  *******************************************************************)
 
+(* In Section 3 - COMPLETE REPLACEMENT of ir_to_asm_list_internal *)
+
 let ir_to_asm_list_internal (ir_instr: ir) : string list =
   (* 检查立即数是否在12位有符号范围内 *)
   let is_small_imm i = i >= -2048 && i <= 2047 in
 
-  (* 辅助函数：智能地处理内存访问，支持大偏移量 *)
+  (* 辅助函数：智能地处理内存访问，支持大偏移量和不同的基址寄存器 *)
   let emit_mem_access op_str reg_name offset base_reg =
     if is_small_imm offset then
       [Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg]
     else
+      (* For large offsets, calculate address manually into t6 *)
       [Printf.sprintf "  li t6, %d" offset;
        Printf.sprintf "  add t6, %s, t6" base_reg;
        Printf.sprintf "  %s %s, 0(t6)" op_str reg_name]
   in
 
-  (* 辅助函数: 将任意操作数的值加载到一个指定的暂存寄存器中 *)
+  (* 辅助函数: 将任意 fp-relative 操作数的值加载到指定的暂存寄存器中 *)
   let ensure_in_reg op target_reg =
     match op with
     | Reg s ->
         if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
     | Stack i ->
+        (* Local variables, params, and spills are always fp-relative *)
         emit_mem_access "lw" target_reg i "fp", target_reg
     | Imm i ->
         [Printf.sprintf "  li %s, %d" target_reg i], target_reg
   in
 
-  (* 辅助函数: 将一个暂存寄存器的值存储回一个目标操作数 *)
+  (* 辅助函数: 将一个暂存寄存器的值存储回一个 fp-relative 目标操作数 *)
   let store_from_reg src_reg dest_op =
     match dest_op with
     | Reg s ->
         if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
     | Stack i ->
+        (* Local variables, params, and spills are always fp-relative *)
         emit_mem_access "sw" src_reg i "fp"
     | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
   in
@@ -400,13 +405,19 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
           let store_dest_ir = store_from_reg "t6" dest in
           load_val_ir @ store_dest_ir
       | _ -> failwith "FATAL: Source of Load must be a Stack location")
+
+  (*** FIXED LOGIC FOR Store BELOW ***)
   | Store (src, dest) ->
       (match dest with
       | Stack i ->
+          (* 正确逻辑: 根据偏移量正负选择基址寄存器 *)
+          let base_reg = if i < 0 then "fp" else "sp" in
           let load_src_ir, src_reg = ensure_in_reg src "t6" in
-          let store_ir = emit_mem_access "sw" src_reg i "fp" in
+          let store_ir = emit_mem_access "sw" src_reg i base_reg in
           load_src_ir @ store_ir
       | _ -> failwith "FATAL: Destination of Store must be a Stack location")
+  (*** END OF FIXED LOGIC ***)
+
   | UnOp (op, dest, src) ->
       let op_str = match op with IR_Neg -> "neg" | IR_Not -> "seqz" in
       let load_ir, src_reg = ensure_in_reg src "t6" in
@@ -435,11 +446,17 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
   | Jump s -> [Printf.sprintf "  j %s" s]
   | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
   | PreCall (stack_space) ->
-      if stack_space > 0 then [Printf.sprintf "  addi sp, sp, -%d" stack_space] else []
+      if stack_space > 0 then
+        (if is_small_imm (-stack_space) then [Printf.sprintf "  addi sp, sp, -%d" stack_space]
+         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  sub sp, sp, t6"])
+      else []
   | Call s ->
       [Printf.sprintf "  call %s" s]
   | PostCall (stack_space) ->
-      if stack_space > 0 then [Printf.sprintf "  addi sp, sp, %d" stack_space] else []
+      if stack_space > 0 then
+        (if is_small_imm stack_space then [Printf.sprintf "  addi sp, sp, %d" stack_space]
+         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  add sp, sp, t6"])
+      else []
   | Prologue (fname, stack_size) ->
       let setup_sp =
         if is_small_imm (-stack_size) then
