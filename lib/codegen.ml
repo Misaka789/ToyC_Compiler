@@ -40,7 +40,9 @@ type ir =
   | BranchZ of operand * string
   | BranchNZ of operand * string
   | Jump of string
-  | Call of string * int
+  | PreCall of int        (* MODIFIED: Was Call of string * int *)
+  | Call of string
+  | PostCall of int
   | Ret
   | Prologue of string * int
   | Epilogue of string * int
@@ -164,66 +166,59 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           )
       )
 | Call (fname, args) ->
-      (*
-       * 新的函数调用策略：
-       * 1. 依次处理每个参数表达式。
-       * 2. 每处理完一个，就立即将其结果保存到栈上的一个临时槽位。
-       * 3. 所有参数都处理并保存完毕后，再从这些临时槽位加载到 a0-a7 或出参栈区域。
-       * 这可以防止后续参数的求值过程覆盖之前参数的计算结果。
-       *)
-
-      (* 步骤 1: 依次求值并立即溢出每个参数的结果 *)
+      (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
       let (eval_ir, arg_spill_locs_rev) =
         List.fold_left (fun (acc_ir, acc_locs) arg_expr ->
-          (* 为每个参数的求值提供一套干净的临时寄存器 *)
           env.temp_counter := 0;
           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
-          
-          (* 为结果分配一个安全的栈槽 *)
           let spill_slot = alloc_temp_stack_slot env in
           let spill_ir = [Store (arg_op, spill_slot)] in
-
-          (* 累加IR代码，并记录下这个安全的存储位置 *)
           (acc_ir @ arg_ir @ spill_ir, spill_slot :: acc_locs)
         ) ([], []) args
       in
-      let arg_locs = List.rev arg_spill_locs_rev in (* 修正顺序 *)
+      let arg_locs = List.rev arg_spill_locs_rev in
 
-      (* 步骤 2: 将保存在安全位置的参数加载到它们最终的目标位置 *)
+      (* 步骤 2: 区分需要通过寄存器和栈传递的参数 *)
       let reg_arg_locs, stack_arg_locs =
-        let rec split n lst = if n <= 0 then ([], lst) else match lst with | [] -> ([], []) | h :: t -> let (taken, rest) = split (n - 1) t in (h :: taken, rest)
-        in split 8 arg_locs
+        let rec split n lst = if n > 0 && lst <> [] then let (h::t) = lst in let (tk, rst) = split (n-1) t in (h::tk, rst) else ([], lst) in
+        split 8 arg_locs
+      in
+      let num_stack_args = List.length stack_arg_locs in
+      let stack_space_for_args = num_stack_args * 4 in
+
+      (* 步骤 3: 按照 ABI 顺序生成 IR *)
+      (* 3.1: (PreCall) 先为出参分配栈空间 *)
+      let pre_call_ir = [PreCall stack_space_for_args] in
+
+      (* 3.2: (Store) 将需要通过栈传递的参数，从其临时位置加载并存入刚分配的出参栈空间 (sp-relative) *)
+      let stack_passing_ir =
+        List.concat (
+          List.mapi (fun i loc ->
+            [ Load (Reg "t6", loc);
+              Store (Reg "t6", Stack (i * 4)) ]
+          ) stack_arg_locs
+        )
       in
 
-      (* 对于需要通过寄存器传递的参数，从它们的栈槽加载到 a0-a7 *)
+      (* 3.3: (Load) 将需要通过寄存器传递的参数，从其临时位置加载到 a0-a7 *)
       let reg_passing_ir =
         List.mapi (fun i loc ->
           Load (Reg ("a" ^ string_of_int i), loc)
         ) reg_arg_locs
       in
 
-      (* 对于需要通过栈传递的参数，我们需要从它们的临时槽加载，再存到出参区域。
-         出参区域是相对于 sp 的，我们用正数偏移量的 Stack 操作数来表示。*)
-      let stack_passing_ir =
-        List.concat (
-          List.mapi (fun i loc ->
-            (* 使用 t6 作为中转寄存器 *)
-            [ Load (Reg "t6", loc);
-             Store (Reg "t6", Stack (i * 4)) ]
-          ) stack_arg_locs
-        )
-      in
-
-      (* 步骤 3: 组装最终的 IR *)
-      let num_stack_args = List.length stack_arg_locs in
+      (* 3.4: (Call) 生成真正的调用指令，以及后续清理和返回值处理 *)
       let temp_ret_op = fresh_temp env in
-      let call_ir = [
-        Call (fname, num_stack_args);
-        Move (temp_ret_op, Reg "a0") (* 将返回值从 a0 移动到临时操作数 *)
+      let call_cleanup_ir = [
+        Call fname;
+        PostCall stack_space_for_args;
+        Move (temp_ret_op, Reg "a0")
       ] in
 
-      (* 最终的IR顺序：参数求值 -> 传递参数到栈 -> 传递参数到寄存器 -> 调用 -> 保存返回值 *)
-      (eval_ir @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_op)
+      (* 最终的 IR 顺序:
+         求值 -> 准备调用栈 -> 传递栈参数 -> 传递寄存器参数 -> 调用和清理 *)
+      let full_ir = eval_ir @ pre_call_ir @ stack_passing_ir @ reg_passing_ir @ call_cleanup_ir in
+      (full_ir, temp_ret_op)
   
 (* _ -> failwith "Unsupported expression type in codegen" *)
 
@@ -431,13 +426,12 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
       load1_ir @ load2_ir @ branch_ir
   | Jump s -> [Printf.sprintf "  j %s" s]
   | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
-  | Call (s, num_stack_args) ->
-      let stack_space = num_stack_args * 4 in
-      if stack_space > 0 then
-        [Printf.sprintf "  addi sp, sp, -%d" stack_space;
-         Printf.sprintf "  call %s" s;
-         Printf.sprintf "  addi sp, sp, %d" stack_space]
-      else [Printf.sprintf "  call %s" s]
+  | PreCall (stack_space) ->
+      if stack_space > 0 then [Printf.sprintf "  addi sp, sp, -%d" stack_space] else []
+  | Call s ->
+      [Printf.sprintf "  call %s" s]
+  | PostCall (stack_space) ->
+      if stack_space > 0 then [Printf.sprintf "  addi sp, sp, %d" stack_space] else []
   | Prologue (fname, stack_size) ->
       let setup_sp =
         if is_small_imm (-stack_size) then
