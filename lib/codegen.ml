@@ -107,6 +107,19 @@ let unop_from_ast_op op =
  * 2. 从 AST 到 IR 的转换 (内部函数)
  *******************************************************************)
 
+ (*添加辅助函数*)
+ (* Helper to push an operand to the top of the runtime stack *)
+let push_op env op =
+  let push_ir = [StoreOutArg (op, 0)] in (* Use StoreOutArg for sp-relative store *)
+  let adjust_sp_ir = [PreCall 4] in (* Decrement sp by 4 *)
+  push_ir @ adjust_sp_ir
+
+(* Helper to pop from the top of the runtime stack into a register *)
+let pop_op env dest_reg =
+  let adjust_sp_ir = [PostCall 4] in (* Increment sp by 4 *)
+  let pop_ir = [Load (dest_reg, Stack 0)] in (* Load from sp+0 *)
+  adjust_sp_ir @ pop_ir
+
 let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
   match e with
   | IntLiteral n ->
@@ -124,47 +137,66 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       let expr_ir, expr_op = gen_expr_ir_internal env expr in
       let dest_reg = fresh_temp env in
       expr_ir @ [UnOp (unop_from_ast_op op, dest_reg, expr_op)], dest_reg
-  | BinOp (op, e1, e2) ->
+   | BinOp (op, e1, e2) ->
       (match op with
+      (* Logical operators with short-circuiting keep their original logic *)
       | And ->
-          let dest_reg = fresh_temp env in
+          let dest_op = fresh_temp env in
           let false_label = fresh_label env "L_false_" in
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-           env.temp_counter := 0; (* MODIFIED *)
+          env.temp_counter := 0;
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
-          [Li(dest_reg, 1); Jump(end_label); Label(false_label); Li(dest_reg, 0); Label(end_label)], dest_reg
+          [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
       | Or ->
-          let dest_reg = fresh_temp env in
-          let true_label = fresh_label env "L_true_" in     
+          let dest_op = fresh_temp env in
+          let true_label = fresh_label env "L_true_" in
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0; (* MODIFIED *)
+          env.temp_counter := 0;
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
-          [Li(dest_reg, 0); Jump(end_label); Label(true_label); Li(dest_reg, 1); Label(end_label)], dest_reg
+          [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
+      
+      (* New stack-based evaluation for all other operators *)
       | _ ->
-          (* Robust strategy: evaluate right, spill, evaluate left, load, compute *)
-          let ir2, op2 = gen_expr_ir_internal env e2 in
-          let temp_slot = alloc_temp_stack_slot env in
-          let save_ir = [Store(op2, temp_slot)] in
-          env.temp_counter := 0; (* MODIFIED *)
+          (* 1. Evaluate left operand *)
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          let loaded_op2 = fresh_temp env in
-          let load_ir = [Load(loaded_op2, temp_slot)] in
-          let dest_reg = fresh_temp env in
+          (* 2. Push its result onto the operand stack *)
+          let push_ir = push_op env op1 in
+
+          (* 3. Evaluate right operand *)
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          (* 4. Ensure right operand's result is in a register (t6) *)
+          let op2_reg = Reg "t6" in
+          let mov2_ir = [Move (op2_reg, op2)] in
+          
+          (* 5. Pop left operand's result into another register (t5) *)
+          let op1_reg = Reg "t5" in
+          let pop_ir = pop_op env op1_reg in
+          
+          (* 6. Perform the computation *)
+          let dest_op = fresh_temp env in
           let final_op = binop_from_ast_op op in
-          (match final_op with
-          | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt |  IR_Ge ->
-              let true_label = fresh_label env "L_true_" in
-              let end_label = fresh_label env "L_end_" in
-              ir2 @ save_ir @ ir1 @ load_ir @
-              [Li(dest_reg, 0); Branch(final_op, op1, loaded_op2, true_label); Jump(end_label);
-               Label(true_label); Li(dest_reg, 1); Label(end_label)], dest_reg
-          | _ ->
-              ir2 @ save_ir @ ir1 @ load_ir @ [BinOp(final_op, dest_reg, op1, loaded_op2)], dest_reg
-          )
+          
+          let compute_ir = 
+            (match final_op with
+            | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
+                let true_label = fresh_label env "L_true_" in
+                let end_label = fresh_label env "L_end_" in
+                [Li(dest_op, 0);
+                 Branch(final_op, op1_reg, op2_reg, true_label);
+                 Jump(end_label);
+                 Label(true_label);
+                 Li(dest_op, 1);
+                 Label(end_label)]
+            | _ ->
+                [BinOp(final_op, dest_op, op1_reg, op2_reg)])
+          in
+          
+          (* Assemble all IR in correct order *)
+          ir1 @ push_ir @ ir2 @ mov2_ir @ pop_ir @ compute_ir, dest_op
       )
 | Call (fname, args) ->
       (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
@@ -397,13 +429,15 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
       let load_ir, src_reg_name = ensure_in_reg src "t6" in
       let store_ir = store_from_reg src_reg_name dest in
       load_ir @ store_ir
-  | Load (dest, src) ->
+   | Load (dest, src) ->
       (match src with
       | Stack i ->
-          let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
+          (* Differentiate between fp-relative (locals) and sp-relative (pop) *)
+          let base_reg = if i < 0 then "fp" else "sp" in
+          let load_val_ir = emit_mem_access "lw" "t6" i base_reg in
           let store_dest_ir = store_from_reg "t6" dest in
           load_val_ir @ store_dest_ir
-      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location")
+      | _ -> failwith "FATAL: Source of Load must be a Stack location")
   | Store (src, dest) ->
       (match dest with
       | Stack i ->
