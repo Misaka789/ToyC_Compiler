@@ -205,11 +205,13 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       (* 对于需要通过栈传递的参数，我们需要从它们的临时槽加载，再存到出参区域。
          出参区域是相对于 sp 的，我们用正数偏移量的 Stack 操作数来表示。*)
       let stack_passing_ir =
-        List.concat_mapi (fun i loc ->
+        List.concat (
+          List.mapi (fun i loc ->
             (* 使用 t6 作为中转寄存器 *)
             [ Load (Reg "t6", loc);
-              Store (Reg "t6", Stack (i * 4)) ]
-        ) stack_arg_locs
+             Store (Reg "t6", Stack (i * 4)) ]
+          ) stack_arg_locs
+        )
       in
 
       (* 步骤 3: 组装最终的 IR *)
