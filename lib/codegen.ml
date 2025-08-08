@@ -180,8 +180,16 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
 
       (* 步骤 2: 区分需要通过寄存器和栈传递的参数 *)
       let reg_arg_locs, stack_arg_locs =
-        let rec split n lst = if n > 0 && lst <> [] then let (h::t) = lst in let (tk, rst) = split (n-1) t in (h::tk, rst) else ([], lst) in
-        split 8 arg_locs
+        let rec split n lst =
+            if n <= 0 then ([], lst)
+            else
+            match lst with
+            | [] -> ([], [])
+            | h :: t ->
+                let (taken, rest) = split (n - 1) t in
+                (h :: taken, rest)
+          in
+          split 8 arg_locs
       in
       let num_stack_args = List.length stack_arg_locs in
       let stack_space_for_args = num_stack_args * 4 in
@@ -484,8 +492,10 @@ let string_of_ir (ir_instr: ir) : string =
   | Load (dest, src) -> Printf.sprintf "  %s = *%s" (op_to_str dest) (op_to_str src)
   | Store (src, dest) -> Printf.sprintf "  *%s = %s" (op_to_str dest) (op_to_str src)
   | Jump s -> Printf.sprintf "  j %s" s
+  | PreCall size -> Printf.sprintf "  precall %d" size
+  | Call s -> Printf.sprintf "  call %s" s
+  | PostCall size -> Printf.sprintf "  postcall %d" size
   | Ret -> "  ret"
-  | Call (s, n) -> Printf.sprintf "  call %s, %d" s n
   | UnOp (op, dest, src) ->
       let op_str = match op with IR_Neg -> "-" | IR_Not -> "!" in
       Printf.sprintf "  %s = %s%s" (op_to_str dest) op_str (op_to_str src)
