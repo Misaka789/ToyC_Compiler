@@ -16,4 +16,6 @@
   menhir
   menhirlib
   ounit2
+  with-test
+  stoio
   with-test))
