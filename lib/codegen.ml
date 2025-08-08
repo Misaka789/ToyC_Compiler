@@ -406,6 +406,7 @@ type cg_env =
   ; mutable temp_counter : int
   ; mutable label_counter : int
   ; current_function_name : string (* NEW: Store the current function's name，用于label命名 *)
+  ; mutable used_s_regs : string list (*使用过的寄存器列表*)
   }
 
 (* 在作用域栈中查找变量 *)
@@ -421,6 +422,30 @@ let find_var_offset (env : cg_env) (name : string) : int =
   find_in_scopes env.vars
 ;;
 
+(*可用寄存器池*)
+let available_regs =
+  [ "t0"
+  ; "t1"
+  ; "t2"
+  ; "t3"
+  ; "t4"
+  ; "t5"
+  ; "t6"
+  ; "s0"
+  ; "s1"
+  ; "s2"
+  ; "s3"
+  ; "s4"
+  ; "s5"
+  ; "s6"
+  ; "s7"
+  ; "s8"
+  ; "s9"
+  ; "s10"
+  ; "s11"
+  ]
+;;
+
 (* 创建一个新的临时寄存器名 (t0-t5) *)
 (* let fresh_temp_reg env =
   if env.temp_counter >= 6 then failwith "Expression too complex, ran out of temporary registers";
@@ -428,10 +453,17 @@ let reg_name = "t" ^ string_of_int env.temp_counter in
   env.temp_counter <- env.temp_counter + 1;
 Reg reg_name *)
 
-(*修改 ：移除数量检查，可以使用无限多虚拟寄存器*)
+(*修改 ：移除数量检查，可以使用无限多虚拟寄存器，并且这里需要追踪寄存器的使用*)
 let fresh_temp_reg env =
-  let reg_name = "t" ^ string_of_int env.temp_counter in
+  if env.temp_counter >= List.length available_regs
+  then
+    failwith
+      "Expression too complex, ran out of all available temporary and saved registers";
+  let reg_name = List.nth available_regs env.temp_counter in
   env.temp_counter <- env.temp_counter + 1;
+  (* 如果我们分配了一个 's' 寄存器，并且是第一次使用它，就记录下来 *)
+  if String.starts_with ~prefix:"s" reg_name && not (List.mem reg_name env.used_s_regs)
+  then env.used_s_regs <- reg_name :: env.used_s_regs;
   Reg reg_name
 ;;
 
@@ -460,7 +492,7 @@ let rec calculate_regs_needed (e : expr) : int =
   | Call (_, args) ->
     let arg_regs = List.map calculate_regs_needed args in
     (* 峰值需求是所有参数计算需求中的最大值，或者至少是1 *)
-    List.fold_left max 1 arg_regs
+    List.fold_left max 0 arg_regs + 1
   (* 二元操作: 这是算法的核心 *)
   | BinOp (_, e1, e2) ->
     let n1 = calculate_regs_needed e1 in
@@ -636,7 +668,7 @@ let rec gen_expr_ir_internal env (e : expr) : ir list * operand =
           , dest_reg )
         | _ ->
           combined_ir @ [ BinOp (final_op, dest_reg, final_op1, final_op2) ], dest_reg))
-  | Call (fname, args) ->
+    (* | Call (fname, args) ->
     let args_code_and_ops = List.map (gen_expr_ir_internal env) args in
     let args_code = List.concat_map fst args_code_and_ops in
     let arg_ops = List.map snd args_code_and_ops in
@@ -663,7 +695,36 @@ let rec gen_expr_ir_internal env (e : expr) : ir list * operand =
     let ret_reg = Reg "a0" in
     let temp_ret_reg = fresh_temp_reg env in
     let call_ir = [ Call (fname, num_stack_args); Move (temp_ret_reg, ret_reg) ] in
-    args_code @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_reg
+    args_code @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_reg *)
+  | Call (fname, args) ->
+    (* [修改] 采用健壮的、逐个处理参数的策略 *)
+    let num_args = List.length args in
+    let arg_dests =
+      List.mapi
+        (fun i _ -> if i < 8 then Reg ("a" ^ string_of_int i) else Stack ((i - 8) * 4))
+        args
+    in
+    let args_setup_ir, _ =
+      List.fold_right
+        (fun (arg_expr, dest) (acc_ir, temp_counter_base) ->
+           env.temp_counter <- temp_counter_base;
+           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
+           let move_ir =
+             match dest with
+             | Reg _ -> [ Move (dest, arg_op) ]
+             | Stack offset -> [ Store (arg_op, Stack offset) ]
+             | _ -> failwith "Invalid argument destination"
+           in
+           acc_ir @ arg_ir @ move_ir, temp_counter_base)
+        (List.combine args arg_dests)
+        ([], 0)
+    in
+    let num_stack_args = max 0 (num_args - 8) in
+    let ret_reg = Reg "a0" in
+    env.temp_counter <- 0;
+    let temp_ret_reg = fresh_temp_reg env in
+    let call_ir = [ Call (fname, num_stack_args); Move (temp_ret_reg, ret_reg) ] in
+    args_setup_ir @ call_ir, temp_ret_reg
 ;;
 
 (* _ -> failwith "Unsupported expression type in codegen" *)
@@ -786,6 +847,7 @@ let gen_func_ir_internal (ana : analysis_result) (f : func_def) : ir list =
     ; temp_counter = 0
     ; label_counter = 0
     ; current_function_name = f.fname (* INITIALIZE HERE *)
+    ; used_s_regs = [] (*初始话为空*)
     }
   in
   (* 3. Generate the IR for the function body using the new helper. *)
@@ -798,6 +860,22 @@ let gen_func_ir_internal (ana : analysis_result) (f : func_def) : ir list =
         | _ -> None)
       params_with_offsets
   in
+  (* [新增] 生成保存/恢复 s 寄存器的IR *)
+  let s_regs_to_save = final_env.used_s_regs in
+  let save_s_regs_ir =
+    List.map
+      (fun reg_name ->
+         final_env.stack_top := !(final_env.stack_top) - 4;
+         Store (Reg reg_name, Stack !(final_env.stack_top)))
+      s_regs_to_save
+  in
+  let restore_s_regs_ir =
+    List.mapi
+      (fun i reg_name ->
+         let offset = !(final_env.stack_top) + (i * 4) in
+         Load (Reg reg_name, Stack offset))
+      (List.rev s_regs_to_save)
+  in
   (* 5. Calculate final stack size using the final environment's stack_top. *)
   let required_stack = abs !(final_env.stack_top) + 8 in
   let stack_size =
@@ -807,9 +885,14 @@ let gen_func_ir_internal (ana : analysis_result) (f : func_def) : ir list =
   in
   (* 6. Assemble the full function IR *)
   [ Prologue (f.fname, stack_size) ]
+  @ save_s_regs_ir
+  (* [添加一行] *)
   @ params_save_ir
   @ body_ir
-  @ [ Epilogue (f.fname, stack_size) ]
+  @ restore_s_regs_ir
+  @
+  (* [添加一行] *)
+  [ Epilogue (f.fname, stack_size) ]
 ;;
 
 (*******************************************************************
