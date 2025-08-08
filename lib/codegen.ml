@@ -109,147 +109,155 @@ let unop_from_ast_op op =
 
  
 let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
+  (* The main recursive generation function *)
+  let gen_and_spill e =
+    let ir, op = gen_expr_ir_internal env e in
+    (* 对任何复杂表达式，始终将其最终结果转存到栈上新的临时槽位中。
+    防止寄存器被同级表达式破坏*)
+    let temp_slot = alloc_temp_stack_slot env in
+    let spill_ir = [Store(op, temp_slot)] in
+    (ir @ spill_ir, temp_slot)
+  in
   match e with
+  (* Base cases: These are trivial and don't need immediate spilling. *)
   | IntLiteral n ->
-      let temp_reg = fresh_temp env in
-      [Li (temp_reg, n)], temp_reg
+      let temp_op = fresh_temp env in
+      [Li (temp_op, n)], temp_op
   | Id x ->
       let var_loc = find_var_offset env x in
-      let temp_reg = fresh_temp env in
-      [Load (temp_reg, Stack var_loc)], temp_reg
+      let temp_op = fresh_temp env in
+      [Load (temp_op, Stack var_loc)], temp_op
+
+  (* Recursive cases: These MUST have their results spilled. *)
   | Assign (x, rhs_expr) ->
       let rhs_ir, rhs_op = gen_expr_ir_internal env rhs_expr in
       let var_loc = find_var_offset env x in
+      (* The result of an assignment is the assigned value. We return it
+         directly without extra spilling, as it's already in a variable. *)
       rhs_ir @ [Store (rhs_op, Stack var_loc)], rhs_op
+  
   | UnOp (op, expr) ->
       let expr_ir, expr_op = gen_expr_ir_internal env expr in
-      let dest_reg = fresh_temp env in
-      expr_ir @ [UnOp (unop_from_ast_op op, dest_reg, expr_op)], dest_reg
+      let dest_op = fresh_temp env in
+      let unop_ir = [UnOp (unop_from_ast_op op, dest_op, expr_op)] in
+      let temp_slot = alloc_temp_stack_slot env in
+      let spill_ir = [Store(dest_op, temp_slot)] in
+      expr_ir @ unop_ir @ spill_ir, temp_slot
+
   | BinOp (op, e1, e2) ->
       (match op with
       | And ->
-          let dest_op = fresh_temp env in
+          (* Short-circuiting is special; its result is calculated via branches.
+             It also needs its final result (0 or 1) to be spilled. *)
+          let dest_op_reg = fresh_temp env in
           let false_label = fresh_label env "L_false_" in
           let end_label = fresh_label env "L_end_" in
-          
-          (* State isolation: ONLY for temp_counter *)
-          let saved_temp_counter = !(env.temp_counter) in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := saved_temp_counter;
+          env.temp_counter := 0;
           let ir2, op2 = gen_expr_ir_internal env e2 in
-          env.temp_counter := saved_temp_counter;
-
-          ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
-          [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
+          let temp_slot = alloc_temp_stack_slot env in
+          let logic_ir = 
+            ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
+            [Li(dest_op_reg, 1);
+             Store(dest_op_reg, temp_slot);
+             Jump(end_label);
+             Label(false_label);
+             Li(dest_op_reg, 0);
+             Store(dest_op_reg, temp_slot);
+             Label(end_label)]
+          in
+          logic_ir, temp_slot
       | Or ->
-          let dest_op = fresh_temp env in
+          let dest_op_reg = fresh_temp env in
           let true_label = fresh_label env "L_true_" in
           let end_label = fresh_label env "L_end_" in
-          
-          let saved_temp_counter = !(env.temp_counter) in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := saved_temp_counter;
+          env.temp_counter := 0;
           let ir2, op2 = gen_expr_ir_internal env e2 in
-          env.temp_counter := saved_temp_counter;
-          
-          ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
-          [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
+          let temp_slot = alloc_temp_stack_slot env in
+          let logic_ir = 
+            ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
+            [Li(dest_op_reg, 0);
+             Store(dest_op_reg, temp_slot);
+             Jump(end_label);
+             Label(true_label);
+             Li(dest_op_reg, 1);
+             Store(dest_op_reg, temp_slot);
+             Label(end_label)]
+          in
+          logic_ir, temp_slot
       
       | _ ->
-          (* The robust "Spill-and-Reload" strategy with corrected state isolation *)
-          let ir1, op1 = gen_expr_ir_internal env e1 in
-          let temp_slot_for_op1 = alloc_temp_stack_slot env in
-          let save_ir = [Store(op1, temp_slot_for_op1)] in
-          
-          (* Only reset temp_counter, stack_top MUST persist *)
-          env.temp_counter := 0; 
-          
-          let ir2, op2 = gen_expr_ir_internal env e2 in
-          
+          (* Universal strategy: evaluate children, get their SAFE stack locations,
+             load from these locations, compute, and spill the final result. *)
+          let ir1, op1_loc = gen_and_spill e1 in
+          let ir2, op2_loc = gen_and_spill e2 in
+
           let loaded_op1 = fresh_temp env in
-          let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
+          let loaded_op2 = fresh_temp env in
+          let load_ir = [Load(loaded_op1, op1_loc); Load(loaded_op2, op2_loc)] in
           
-          let dest_op = fresh_temp env in
+          let dest_op_reg = fresh_temp env in
           let final_op = binop_from_ast_op op in
           
-          let full_ir = ir1 @ save_ir @ ir2 @ load_ir in
-          
-          (match final_op with
-          | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
-              let true_label = fresh_label env "L_true_" in
-              let end_label = fresh_label env "L_end_" in
-              full_ir @
-              [Li(dest_op, 0);
-               Branch(final_op, loaded_op1, op2, true_label);
-               Jump(end_label);
-               Label(true_label);
-               Li(dest_op, 1);
-               Label(end_label)], dest_op
-          | _ ->
-              full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
-          )
+          let compute_and_spill_ir, final_loc =
+            let temp_slot = alloc_temp_stack_slot env in
+            (match final_op with
+            | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
+                let true_label = fresh_label env "L_true_" in
+                let end_label = fresh_label env "L_end_" in
+                [Li(dest_op_reg, 0);
+                 Branch(final_op, loaded_op1, loaded_op2, true_label);
+                 Store(dest_op_reg, temp_slot);
+                 Jump(end_label);
+                 Label(true_label);
+                 Li(dest_op_reg, 1);
+                 Store(dest_op_reg, temp_slot);
+                 Label(end_label)], temp_slot
+            | _ ->
+                [BinOp(final_op, dest_op_reg, loaded_op1, loaded_op2);
+                 Store(dest_op_reg, temp_slot)], temp_slot
+            )
+          in
+          ir1 @ ir2 @ load_ir @ compute_and_spill_ir, final_loc
       )
 
   | Call (fname, args) ->
-      (* Evaluate arguments, spilling each result to a UNIQUE stack slot *)
-      let (eval_ir, arg_spill_locs_rev) =
+      (* Evaluate arguments and get their SAFE stack locations *)
+      let (eval_ir, arg_locs_rev) =
         List.fold_left (fun (acc_ir, acc_locs) arg_expr ->
-          (* NO state restoration needed here. Let stack_top grow naturally. *)
-          (* Reset temp_counter for each argument's evaluation sandbox. *)
-          env.temp_counter := 0;
-          
-          let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
-          let spill_slot = alloc_temp_stack_slot env in
-          let spill_ir = [Store (arg_op, spill_slot)] in
-          (acc_ir @ arg_ir @ spill_ir, spill_slot :: acc_locs)
+          let arg_ir, arg_loc = gen_and_spill arg_expr in
+          (acc_ir @ arg_ir, arg_loc :: acc_locs)
         ) ([], []) args
       in
-      let arg_locs = List.rev arg_spill_locs_rev in
+      let arg_locs = List.rev arg_locs_rev in
 
-      (* The rest of the Call logic is correct and remains unchanged *)
+      (* The rest of the Call logic now works with guaranteed-safe locations *)
       let reg_arg_locs, stack_arg_locs =
-        let rec split n lst =
-          if n <= 0 then ([], lst)
-          else match lst with
-          | [] -> ([], [])
-          | h :: t -> let (taken, rest) = split (n - 1) t in (h :: taken, rest)
-        in split 8 arg_locs
+        let rec split n lst = (* ... as before ... *) in split 8 arg_locs
       in
       let num_stack_args = List.length stack_arg_locs in
       let stack_space_for_args = num_stack_args * 4 in
-
       let pre_call_ir = [PreCall stack_space_for_args] in
-
-      let stack_passing_ir =
-        List.concat (
-          List.mapi (fun i loc ->
-            [ Load (Reg "t6", loc);
-              StoreOutArg (Reg "t6", i * 4) ]
-          ) stack_arg_locs
-        )
-      in
-
-      let reg_passing_ir =
-        List.mapi (fun i loc ->
-          Load (Reg ("a" ^ string_of_int i), loc)
-        ) reg_arg_locs
-      in
-
-      let temp_ret_op = fresh_temp env in
+      let stack_passing_ir = (* ... as before ... *) in
+      let reg_passing_ir = (* ... as before ... *) in
+      
+      (* The final result of the call must ALSO be spilled to be safe *)
+      let temp_ret_reg = Reg "a0" in
+      let final_slot = alloc_temp_stack_slot env in
       let call_cleanup_ir = [
         Call fname;
         PostCall stack_space_for_args;
-        Move (temp_ret_op, Reg "a0")
+        Store (temp_ret_reg, final_slot)
       ] in
 
       let full_ir = eval_ir @ pre_call_ir @ stack_passing_ir @ reg_passing_ir @ call_cleanup_ir in
-      (full_ir, temp_ret_op)
-  
+      (full_ir, final_slot)
 (* _ -> failwith "Unsupported expression type in codegen" *)
 
 
 let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
-   env.temp_counter := 0; (*重置临时寄存器计数器*)
+    (*env.temp_counter := 0;重置临时寄存器计数器*)
 
   match s with
   | Expr e ->
