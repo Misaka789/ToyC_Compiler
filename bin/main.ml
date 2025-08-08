@@ -47,7 +47,7 @@ let () =
 
 (* bin/main.ml - Debugging version *)
 
-open Toyc_compiler_lib
+(* open Toyc_compiler_lib
 
 let () =
   let source_code =
@@ -257,9 +257,9 @@ let () =
     Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string e);
     Printexc.print_backtrace stderr;
     exit 1
-;;
+;; *)
 
-(* open Toyc_compiler_lib
+open Toyc_compiler_lib
 
 let read_stdin_all () =
   let buf = Buffer.create 4096 in
@@ -287,4 +287,4 @@ let () =
     prerr_endline ("Unexpected error: " ^ Printexc.to_string e);
     Printexc.print_backtrace stderr;
     exit 1
-;; *)
+;;
