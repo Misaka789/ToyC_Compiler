@@ -163,22 +163,66 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
               ir2 @ save_ir @ ir1 @ load_ir @ [BinOp(final_op, dest_reg, op1, loaded_op2)], dest_reg
           )
       )
-  | Call (fname, args) ->
-      let args_code_and_ops = List.map (gen_expr_ir_internal env) args in
-      let args_code = List.concat_map fst args_code_and_ops in
-      let arg_ops = List.map snd args_code_and_ops in
-      let reg_args, stack_args =
-        let rec split n lst = if n <= 0 then ([], lst) else match lst with | [] -> ([], []) | h :: t -> let (taken, rest) = split (n - 1) t in (h :: taken, rest)
-        in split 8 arg_ops
+| Call (fname, args) ->
+      (*
+       * 新的函数调用策略：
+       * 1. 依次处理每个参数表达式。
+       * 2. 每处理完一个，就立即将其结果保存到栈上的一个临时槽位。
+       * 3. 所有参数都处理并保存完毕后，再从这些临时槽位加载到 a0-a7 或出参栈区域。
+       * 这可以防止后续参数的求值过程覆盖之前参数的计算结果。
+       *)
+
+      (* 步骤 1: 依次求值并立即溢出每个参数的结果 *)
+      let (eval_ir, arg_spill_locs_rev) =
+        List.fold_left (fun (acc_ir, acc_locs) arg_expr ->
+          (* 为每个参数的求值提供一套干净的临时寄存器 *)
+          env.temp_counter := 0;
+          let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
+          
+          (* 为结果分配一个安全的栈槽 *)
+          let spill_slot = alloc_temp_stack_slot env in
+          let spill_ir = [Store (arg_op, spill_slot)] in
+
+          (* 累加IR代码，并记录下这个安全的存储位置 *)
+          (acc_ir @ arg_ir @ spill_ir, spill_slot :: acc_locs)
+        ) ([], []) args
       in
-      let reg_passing_ir = List.mapi (fun i op -> Move (Reg ("a" ^ string_of_int i), op)) reg_args in
-      let stack_passing_ir = List.mapi (fun i op -> Store (op, Stack (i * -4))) (List.rev stack_args) in
-      let num_stack_args = List.length stack_args in      
-      let ret_reg = Reg "a0" in
-      let temp_ret_reg = fresh_temp env in
-      let call_ir = [Call (fname, num_stack_args);
-Move (temp_ret_reg, ret_reg)] in
-      args_code @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_reg
+      let arg_locs = List.rev arg_spill_locs_rev in (* 修正顺序 *)
+
+      (* 步骤 2: 将保存在安全位置的参数加载到它们最终的目标位置 *)
+      let reg_arg_locs, stack_arg_locs =
+        let rec split n lst = if n <= 0 then ([], lst) else match lst with | [] -> ([], []) | h :: t -> let (taken, rest) = split (n - 1) t in (h :: taken, rest)
+        in split 8 arg_locs
+      in
+
+      (* 对于需要通过寄存器传递的参数，从它们的栈槽加载到 a0-a7 *)
+      let reg_passing_ir =
+        List.mapi (fun i loc ->
+          Load (Reg ("a" ^ string_of_int i), loc)
+        ) reg_arg_locs
+      in
+
+      (* 对于需要通过栈传递的参数，我们需要从它们的临时槽加载，再存到出参区域。
+         出参区域是相对于 sp 的，我们用正数偏移量的 Stack 操作数来表示。*)
+      let stack_passing_ir =
+        List.concat_mapi (fun i loc ->
+            (* 使用 t6 作为中转寄存器 *)
+            [ Load (Reg "t6", loc);
+              Store (Reg "t6", Stack (i * 4)) ]
+        ) stack_arg_locs
+      in
+
+      (* 步骤 3: 组装最终的 IR *)
+      let num_stack_args = List.length stack_arg_locs in
+      let temp_ret_op = fresh_temp env in
+      let call_ir = [
+        Call (fname, num_stack_args);
+        Move (temp_ret_op, Reg "a0") (* 将返回值从 a0 移动到临时操作数 *)
+      ] in
+
+      (* 最终的IR顺序：参数求值 -> 传递参数到栈 -> 传递参数到寄存器 -> 调用 -> 保存返回值 *)
+      (eval_ir @ stack_passing_ir @ reg_passing_ir @ call_ir, temp_ret_op)
+  
 (* _ -> failwith "Unsupported expression type in codegen" *)
 
 
