@@ -303,11 +303,11 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
 (* lib/codegen.ml, in Section 3 *)
 
 let ir_to_asm_list_internal (ir_instr: ir) : string list =
-  let op_to_str op = match op with
+  (*let op_to_str op = match op with
     | Imm i -> string_of_int i
     | Reg s -> s
     | Stack i -> Printf.sprintf "%d(fp)" i
-  in
+  in*)
 
   (* 新增辅助函数:
      将任意操作数的值加载到一个指定的暂存寄存器中。
