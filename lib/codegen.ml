@@ -121,13 +121,11 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       [Load (temp_op, Stack var_loc)], temp_op
   
   | Assign (x, rhs_expr) ->
-      (* Back to the simple, efficient implementation *)
       let rhs_ir, rhs_op = gen_expr_ir_internal env rhs_expr in
       let var_loc = find_var_offset env x in
       rhs_ir @ [Store (rhs_op, Stack var_loc)], rhs_op
   
   | UnOp (op, expr) ->
-      (* Back to the simple, efficient implementation *)
       let expr_ir, expr_op = gen_expr_ir_internal env expr in
       let dest_op = fresh_temp env in
       expr_ir @ [UnOp (unop_from_ast_op op, dest_op, expr_op)], dest_op
@@ -139,7 +137,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let false_label = fresh_label env "L_false_" in
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0;
+          (* NO reset here. Let the counter grow. *)
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
           [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
@@ -148,18 +146,18 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let true_label = fresh_label env "L_true_" in
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0;
+          (* NO reset here. *)
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
           [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
       
-      (* RESTORED: The robust "Spill-and-Reload" strategy *)
+      (* The classic Spill-and-Reload, but without the flawed reset. *)
       | _ ->
           let ir1, op1 = gen_expr_ir_internal env e1 in
           let temp_slot_for_op1 = alloc_temp_stack_slot env in
           let save_ir = [Store(op1, temp_slot_for_op1)] in
           
-          env.temp_counter := 0;
+          (* NO reset of temp_counter. Let it continue from where e1 left off. *)
           
           let ir2, op2 = gen_expr_ir_internal env e2 in
           
@@ -188,10 +186,11 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       )
 
   | Call (fname, args) ->
-      (* This version of the Call handler is proven correct and robust. KEEP IT. *)
+      (* The linear allocation model naturally handles argument evaluation. *)
       let (eval_ir, arg_spill_locs_rev) =
         List.fold_left (fun (acc_ir, acc_locs) arg_expr ->
-          env.temp_counter := 0;
+          (* NO reset of temp_counter. Each argument evaluation continues
+             where the previous one left off, ensuring unique temporary slots. *)
           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
           let spill_slot = alloc_temp_stack_slot env in
           let spill_ir = [Store (arg_op, spill_slot)] in
