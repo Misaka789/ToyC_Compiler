@@ -132,21 +132,12 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let false_label = fresh_label env "L_false_" in
           let end_label = fresh_label env "L_end_" in
           
-          (* Save state before evaluating sub-expressions *)
+          (* State isolation: ONLY for temp_counter *)
           let saved_temp_counter = !(env.temp_counter) in
-          let saved_stack_top = !(env.stack_top) in
-
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          
-          (* Restore state for the evaluation of the second sub-expression *)
           env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
-          
           let ir2, op2 = gen_expr_ir_internal env e2 in
-          
-          (* Restore state after all sub-expressions are done *)
           env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
 
           ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
           [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
@@ -156,42 +147,25 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let end_label = fresh_label env "L_end_" in
           
           let saved_temp_counter = !(env.temp_counter) in
-          let saved_stack_top = !(env.stack_top) in
-
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          
           env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
-          
           let ir2, op2 = gen_expr_ir_internal env e2 in
-
           env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
           
           ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
           [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
       
       | _ ->
-          (* The robust "Spill-and-Reload" strategy with proper state isolation *)
-          let saved_temp_counter = !(env.temp_counter) in
-          let saved_stack_top = !(env.stack_top) in
-
+          (* The robust "Spill-and-Reload" strategy with corrected state isolation *)
           let ir1, op1 = gen_expr_ir_internal env e1 in
-          
-          (* The temporary slot for op1 must be allocated *after* e1 is fully evaluated *)
           let temp_slot_for_op1 = alloc_temp_stack_slot env in
           let save_ir = [Store(op1, temp_slot_for_op1)] in
-
-          (* Restore state completely before evaluating e2 *)
-          env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
-
+          
+          (* Only reset temp_counter, stack_top MUST persist *)
+          env.temp_counter := 0; 
+          
           let ir2, op2 = gen_expr_ir_internal env e2 in
           
-          (* Restore state after e2 is done, before allocating final temps *)
-          env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
-
           let loaded_op1 = fresh_temp env in
           let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
           
@@ -217,15 +191,12 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       )
 
   | Call (fname, args) ->
-      (* Evaluate arguments in isolated environments *)
-      let saved_temp_counter = !(env.temp_counter) in
-      let saved_stack_top = !(env.stack_top) in
-      
+      (* Evaluate arguments, spilling each result to a UNIQUE stack slot *)
       let (eval_ir, arg_spill_locs_rev) =
         List.fold_left (fun (acc_ir, acc_locs) arg_expr ->
-          (* Restore state for EACH argument *)
-          env.temp_counter := saved_temp_counter;
-          env.stack_top := saved_stack_top;
+          (* NO state restoration needed here. Let stack_top grow naturally. *)
+          (* Reset temp_counter for each argument's evaluation sandbox. *)
+          env.temp_counter := 0;
           
           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
           let spill_slot = alloc_temp_stack_slot env in
@@ -235,10 +206,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       in
       let arg_locs = List.rev arg_spill_locs_rev in
 
-      (* Restore state after all arguments are evaluated and spilled *)
-      env.temp_counter := saved_temp_counter;
-      env.stack_top := saved_stack_top;
-
+      (* The rest of the Call logic is correct and remains unchanged *)
       let reg_arg_locs, stack_arg_locs =
         let rec split n lst =
           if n <= 0 then ([], lst)
@@ -281,7 +249,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
 
 
 let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir list * cg_env =
-   (*env.temp_counter := 0; 语句层面的强制重置不再必要*)
+   env.temp_counter := 0; (*重置临时寄存器计数器*)
 
   match s with
   | Expr e ->
