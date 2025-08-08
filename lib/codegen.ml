@@ -302,38 +302,26 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
 (* This section remains unchanged *)
 (* lib/codegen.ml, in Section 3 *)
 
-let ir_to_asm_list_internal (ir_instr: ir) : string list =
-  (*let op_to_str op = match op with
-    | Imm i -> string_of_int i
-    | Reg s -> s
-    | Stack i -> Printf.sprintf "%d(fp)" i
-  in*)
+(* lib/codegen.ml, in Section 3 -- 完整替换 *)
 
-  (* 新增辅助函数:
-     将任意操作数的值加载到一个指定的暂存寄存器中。
-     返回生成的汇编指令和最终所在的寄存器名。
-     注意：我们使用 t5 和 t6 作为内部专用的暂存寄存器。*)
+let ir_to_asm_list_internal (ir_instr: ir) : string list =
+  (* 辅助函数: 将任意操作数的值加载到一个指定的暂存寄存器中 *)
   let ensure_in_reg op target_reg =
     match op with
     | Reg s ->
-        (* 如果操作数本身就是寄存器，生成一条mv指令，除非它已经是目标寄存器 *)
         if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
     | Stack i ->
-        (* 如果是栈操作数，用lw加载 *)
         [Printf.sprintf "  lw %s, %d(fp)" target_reg i], target_reg
     | Imm i ->
-        (* 如果是立即数，用li加载 *)
         [Printf.sprintf "  li %s, %d" target_reg i], target_reg
   in
 
-  (* 新增辅助函数: 将一个暂存寄存器的值存储回一个目标操作数 *)
+  (* 辅助函数: 将一个暂存寄存器的值存储回一个目标操作数 *)
   let store_from_reg src_reg dest_op =
     match dest_op with
     | Reg s ->
-        (* 如果目标是寄存器，用mv指令，除非是同一个寄存器 *)
         if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
     | Stack i ->
-        (* 如果目标是栈，用sw存储 *)
         [Printf.sprintf "  sw %s, %d(fp)" src_reg i]
     | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
   in
@@ -351,22 +339,29 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
       let store_ir = store_from_reg src_reg_name dest in
       load_ir @ store_ir
 
+  (*** FIXED LOGIC FOR Load and Store BELOW ***)
+
   | Load (dest, src) ->
-      (* src 必须是地址，即Stack i。我们先把它加载到t6。*)
-      let load_addr_ir, addr_reg = ensure_in_reg src "t6" in
-      (* 然后从这个地址加载真实的值到t5 *)
-      let load_val_ir = [Printf.sprintf "  lw t5, 0(%s)" addr_reg] in
-      let store_ir = store_from_reg "t5" dest in
-      load_addr_ir @ load_val_ir @ store_ir
+      (match src with
+      | Stack i ->
+          (* 正确逻辑: 直接从 src 地址加载值到 t6 *)
+          let load_val_ir = [Printf.sprintf "  lw t6, %d(fp)" i] in
+          (* 然后将 t6 的值存到最终目的地 dest *)
+          let store_dest_ir = store_from_reg "t6" dest in
+          load_val_ir @ store_dest_ir
+      | _ -> failwith "FATAL: Source of Load must be a Stack location")
 
   | Store (src, dest) ->
-      (* 加载要存储的值到t5 *)
-      let load_src_ir, src_reg = ensure_in_reg src "t5" in
-      (* 加载目标地址到t6 *)
-      let load_dest_ir, dest_reg = ensure_in_reg dest "t6" in
-      (* 执行存储 *)
-      let store_ir = [Printf.sprintf "  sw %s, 0(%s)" src_reg dest_reg] in
-      load_src_ir @ load_dest_ir @ store_ir
+      (match dest with
+      | Stack i ->
+          (* 正确逻辑: 先把要存储的值 src 加载到 t6 *)
+          let load_src_ir, src_reg = ensure_in_reg src "t6" in
+          (* 然后直接将 t6 的值存储到 dest 地址 *)
+          let store_ir = [Printf.sprintf "  sw %s, %d(fp)" src_reg i] in
+          load_src_ir @ store_ir
+      | _ -> failwith "FATAL: Destination of Store must be a Stack location")
+
+  (*** END OF FIXED LOGIC ***)
 
   | UnOp (op, dest, src) ->
       let op_str = match op with IR_Neg -> "neg" | IR_Not -> "seqz" in
@@ -398,7 +393,6 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
       let branch_ir = [Printf.sprintf "  %s %s, %s, %s" branch_op_str reg1 reg2 label] in
       load1_ir @ load2_ir @ branch_ir
 
-  (* 以下部分保持原样，无需修改 *)
   | Jump s -> [Printf.sprintf "  j %s" s]
   | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
   | Call (s, num_stack_args) ->
