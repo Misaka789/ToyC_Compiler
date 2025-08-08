@@ -67,6 +67,10 @@ let find_var_offset (env: cg_env) (name: string) : int =
   in
   find_in_scopes env.vars
 
+(* 在栈上为临时计算结果分配空间 *)
+let alloc_temp_stack_slot env =
+  env.stack_top := !(env.stack_top) - 4;
+Stack !(env.stack_top)
 
 (* 创建一个新的临时操作数。优先使用寄存器 (t0-t5)，用尽后在栈上分配空间 *)
 let fresh_temp_reg env =
@@ -84,10 +88,7 @@ let fresh_label env pfx =
   env.label_counter <- env.label_counter + 1;
   label_name
 
-(* 在栈上为临时计算结果分配空间 *)
-let alloc_temp_stack_slot env =
-  env.stack_top := !(env.stack_top) - 4;
-Stack !(env.stack_top)
+
 
 (* 将 Ast 操作符转换为内部 IR 操作符的辅助函数 *)
 let binop_from_ast_op op =
