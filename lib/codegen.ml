@@ -704,9 +704,10 @@ let rec gen_expr_ir_internal env (e : expr) : ir list * operand =
         (fun i _ -> if i < 8 then Reg ("a" ^ string_of_int i) else Stack ((i - 8) * 4))
         args
     in
+    (* [修改] 将 fold_right 改为 fold_left，从左到右处理参数 *)
     let args_setup_ir, _ =
-      List.fold_right
-        (fun (arg_expr, dest) (acc_ir, temp_counter_base) ->
+      List.fold_left
+        (fun (acc_ir, temp_counter_base) (arg_expr, dest) ->
            env.temp_counter <- temp_counter_base;
            let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
            let move_ir =
@@ -716,8 +717,8 @@ let rec gen_expr_ir_internal env (e : expr) : ir list * operand =
              | _ -> failwith "Invalid argument destination"
            in
            acc_ir @ arg_ir @ move_ir, temp_counter_base)
-        (List.combine args arg_dests)
         ([], 0)
+        (List.combine args arg_dests)
     in
     let num_stack_args = max 0 (num_args - 8) in
     let ret_reg = Reg "a0" in

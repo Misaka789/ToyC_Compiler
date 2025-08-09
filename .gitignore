@@ -7,7 +7,7 @@ _build/
 *.o
 *.a
 *.so
-
+*.opam
 # OCaml/opam local switch
 _opam/
 
