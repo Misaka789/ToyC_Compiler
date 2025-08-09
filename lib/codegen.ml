@@ -75,15 +75,26 @@ let alloc_temp_stack_slot env =
   env.stack_top := !(env.stack_top) - 4;
 Stack !(env.stack_top)
 
-(* 创建一个新的临时操作数。优先使用寄存器 (t0-t5)，用尽后在栈上分配空间 *)
+(* 创建一个新的临时操作数。优先使用寄存器 (t0-t3)，用尽后在栈上分配空间 *)
 let fresh_temp env = (* Renamed from fresh_temp for clarity *)
-  if !(env.temp_counter) < 6 then (
+  if !(env.temp_counter) < 4 then (
     let reg_name = "t" ^ string_of_int !(env.temp_counter) in
     env.temp_counter := !(env.temp_counter) + 1;
     Reg reg_name
   ) else (
     alloc_temp_stack_slot env
   )
+
+let stack_temp_counter = ref 0
+
+(* 生成栈中转专用寄存器(t4-t6) *)
+let get_stack_temp_reg () =
+  (* 轮换使用 t4-t6 以避免冲突 *)
+  let regs = ["t4"; "t5"; "t6"] in
+  let idx = !stack_temp_counter mod 3 in
+  stack_temp_counter := !stack_temp_counter + 1;
+  Reg (List.nth regs idx)
+
 
 (* 创建一个新的标签 *)
 let fresh_label env pfx =
@@ -366,7 +377,7 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
 
 (* In Section 3 - FINAL, CORRECTED VERSION of ir_to_asm_list_internal *)
 
-let ir_to_asm_list_internal (ir_instr: ir) : string list =
+(* let ir_to_asm_list_internal (ir_instr: ir) : string list =
   let is_small_imm i = i >= -2048 && i <= 2047 in
   let emit_mem_access op_str reg_name offset base_reg =
     if is_small_imm offset then
@@ -517,6 +528,171 @@ let ir_to_asm_list_internal (ir_instr: ir) : string list =
            Printf.sprintf "  add fp, sp, t6"]
       in
       [".text"; ".globl " ^ fname; fname ^ ":"] @ setup_sp @ save_ra @ save_fp @ setup_fp
+  | Epilogue (fname, stack_size) ->
+      let restore_fp = emit_mem_access "lw" "fp" (stack_size - 8) "sp" in
+      let restore_ra = emit_mem_access "lw" "ra" (stack_size - 4) "sp" in
+      let teardown_sp =
+        if is_small_imm stack_size then
+          [Printf.sprintf "  addi sp, sp, %d" stack_size]
+        else
+          [Printf.sprintf "  li t6, %d" stack_size;
+           Printf.sprintf "  add sp, sp, t6"]
+      in
+      [".L_ret_" ^ fname ^ ":"] @ restore_fp @ restore_ra @ teardown_sp @ ["  ret"] *)
+
+  let ir_to_asm_list_internal (ir_instr: ir) : string list =
+  let is_small_imm i = i >= -2048 && i <= 2047 in
+  let emit_mem_access op_str reg_name offset base_reg =
+    if is_small_imm offset then
+      [Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg]
+    else
+      [Printf.sprintf "  li t6, %d" offset;
+       Printf.sprintf "  add t6, %s, t6" base_reg;
+       Printf.sprintf "  %s %s, 0(t6)" op_str reg_name]
+  in
+  let ensure_in_reg op target_reg =
+    match op with
+    | Reg s ->
+        if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
+    | Stack i ->
+        emit_mem_access "lw" target_reg i "fp", target_reg
+    | Imm i ->
+        [Printf.sprintf "  li %s, %d" target_reg i], target_reg
+  in
+  let store_from_reg src_reg dest_op =
+    match dest_op with
+    | Reg s ->
+        if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
+    | Stack i ->
+        emit_mem_access "sw" src_reg i "fp"
+    | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
+  in
+
+  (*** NEW: A robust helper to load any operand into a dedicated temporary register ***)
+  let load_operand_to_temp op =
+      match op with
+      | Reg s -> [], s (* Already a register, no load needed *)
+      | Stack i ->
+          let temp_reg = match get_stack_temp_reg () with Reg s -> s | _ -> failwith "impossible" in
+          emit_mem_access "lw" temp_reg i "fp", temp_reg
+      | Imm i ->
+          let temp_reg = match get_stack_temp_reg () with Reg s -> s | _ -> failwith "impossible" in
+          [Printf.sprintf "  li %s, %d" temp_reg i], temp_reg
+  in
+
+  match ir_instr with
+  | Label s -> [s ^ ":"] 
+  | Li (dest, imm) ->
+      let load_imm_ir = [Printf.sprintf "  li t6, %d" imm] in
+      let store_ir = store_from_reg "t6" dest in
+      load_imm_ir @ store_ir
+  | Move (dest, src) ->
+      let load_ir, src_reg_name = ensure_in_reg src "t6" in
+      let store_ir = store_from_reg src_reg_name dest in
+      load_ir @ store_ir 
+  | Load (dest, src) ->
+      (match src with
+      | Stack i ->
+          let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
+          let store_dest_ir = store_from_reg "t6" dest in
+          load_val_ir @ store_dest_ir
+      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location") 
+  | Store (src, dest) ->
+      (match dest with
+      | Stack i ->
+          let load_src_ir, src_reg = ensure_in_reg src "t6" in
+          let store_ir = emit_mem_access "sw" src_reg i "fp" in
+          load_src_ir @ store_ir
+      | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location") 
+  | StoreOutArg (src, offset) ->
+      let load_src_ir, src_reg = ensure_in_reg src "t6" in
+      let store_ir = emit_mem_access "sw" src_reg offset "sp" in
+      load_src_ir @ store_ir 
+  | UnOp (op, dest, src) ->
+      let op_str = match op with IR_Neg -> "neg"  | IR_Not -> "seqz"  in
+      let load_ir, src_reg = ensure_in_reg src "t6" in
+      let compute_ir = [Printf.sprintf "  %s t6, %s" op_str src_reg] in
+      let store_ir = store_from_reg "t6" dest in
+      load_ir @ compute_ir @ store_ir 
+
+  (*** MODIFIED, ROBUST BinOp ASSEMBLY LOGIC ***)
+  | BinOp (op, dest, src1, src2) ->
+      stack_temp_counter := 0; (* Reset temp register pool for each instruction *)
+      let op_str = match op with
+        | IR_Add -> "add"  | IR_Sub -> "sub"  | IR_Mul -> "mul"  | IR_Div -> "div"  | IR_Mod -> "rem" 
+        | _ -> failwith "Invalid op for BinOp" 
+      in
+
+      (* 1. Safely load both source operands into dedicated temp registers (t4, t5) *)
+      let (load1_ir, r1) = load_operand_to_temp src1 in
+      let (load2_ir, r2) = load_operand_to_temp src2 in
+
+      (* 2. Get a third temp register (t6) to store the result of the computation *)
+      let result_reg = match get_stack_temp_reg () with Reg s -> s | _ -> failwith "impossible" in
+      let compute_ir = [Printf.sprintf "  %s %s, %s, %s" op_str result_reg r1 r2] in
+
+      (* 3. Store the result from the temp register to the final destination *)
+      let store_ir = store_from_reg result_reg dest in
+
+      load1_ir @ load2_ir @ compute_ir @ store_ir
+
+  | BranchZ (src, label) ->
+      let load_ir, reg = ensure_in_reg src "t6" in
+      load_ir @ [Printf.sprintf "  beqz %s, %s" reg label] 
+  | BranchNZ (src, label) ->
+      let load_ir, reg = ensure_in_reg src "t6" in
+      load_ir @ [Printf.sprintf "  bnez %s, %s" reg label] 
+
+  (*** MODIFIED, ROBUST Branch ASSEMBLY LOGIC ***)
+  | Branch (op, src1, src2, label) ->
+      stack_temp_counter := 0; (* Reset temp register pool *)
+      let branch_op_str = match op with
+        | IR_Eq -> "beq"  | IR_Neq -> "bne"  | IR_Lt -> "blt"  | IR_Le -> "ble"  | IR_Gt -> "bgt"  | IR_Ge -> "bge" 
+        | _ -> failwith "Invalid op for Branch" 
+      in
+      (* 1. Safely load both source operands into dedicated temp registers *)
+      let (load1_ir, r1) = load_operand_to_temp src1 in
+      let (load2_ir, r2) = load_operand_to_temp src2 in
+      
+      (* 2. Perform the branch comparison *)
+      let branch_ir = [Printf.sprintf "  %s %s, %s, %s" branch_op_str r1 r2 label] in
+      
+      load1_ir @ load2_ir @ branch_ir
+
+  (* ... All other cases from Jump to Epilogue remain the same ... *)
+  | Jump s -> [Printf.sprintf "  j %s" s] 
+  | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue" 
+  | PreCall (stack_space) ->
+      if stack_space > 0 then
+        (if is_small_imm (-stack_space) then [Printf.sprintf "  addi sp, sp, -%d" stack_space]
+         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  sub sp, sp, t6"])
+      else []
+  | Call s ->
+      [Printf.sprintf "  call %s" s] 
+  | PostCall (stack_space) ->
+      if stack_space > 0 then
+        (if is_small_imm stack_space then [Printf.sprintf "  addi sp, sp, %d" stack_space]
+         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  add sp, sp, t6"])
+      else []
+  | Prologue (fname, stack_size) ->
+      let setup_sp =
+        if is_small_imm (-stack_size) then
+          [Printf.sprintf "  addi sp, sp, -%d" stack_size]
+        else
+          [Printf.sprintf "  li t6, %d" stack_size;
+           Printf.sprintf "  sub sp, sp, t6"]
+      in
+      let save_ra = emit_mem_access "sw" "ra" (stack_size - 4) "sp" in
+      let save_fp = emit_mem_access "sw" "fp" (stack_size - 8) "sp" in
+      let setup_fp =
+        if is_small_imm stack_size then
+          [Printf.sprintf "  addi fp, sp, %d" stack_size]
+        else
+          [Printf.sprintf "   li t6, %d" stack_size;
+           Printf.sprintf "  add fp, sp, t6"]
+      in
+      [".text";
+       ".globl " ^ fname; fname ^ ":"] @ setup_sp @ save_ra @ save_fp @ setup_fp
   | Epilogue (fname, stack_size) ->
       let restore_fp = emit_mem_access "lw" "fp" (stack_size - 8) "sp" in
       let restore_ra = emit_mem_access "lw" "ra" (stack_size - 4) "sp" in
