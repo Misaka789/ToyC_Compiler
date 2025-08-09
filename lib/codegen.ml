@@ -147,7 +147,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
       
       (* The robust "Spill-and-Reload" strategy, but this time with a correct assembler *)
-      | _ ->
+      (* | _ ->
           (* This order of evaluation (e1 then e2) is more conventional *)
           let ir1, op1 = gen_expr_ir_internal env e1 in
           let temp_slot_for_op1 = alloc_temp_stack_slot env in
@@ -178,7 +178,31 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
                Label(end_label)], dest_op
           | _ ->
               full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
-          )
+          ) *)
+           | _ ->
+    (* 采用更简洁、鲁棒的顺序求值策略 *)
+    let ir1, op1 = gen_expr_ir_internal env e1 in
+    let ir2, op2 = gen_expr_ir_internal env e2 in
+    
+    let dest_op = fresh_temp env in
+    let final_op = binop_from_ast_op op in
+    
+    let full_ir = ir1 @ ir2 in (* 直接连接两个操作数的IR *)
+    
+    (match final_op with
+    | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
+        let true_label = fresh_label env "L_true_" in
+        let end_label = fresh_label env "L_end_" in
+        full_ir @
+        [Li(dest_op, 0);
+         Branch(final_op, op1, op2, true_label); (* 直接使用 op1 和 op2 *)
+         Jump(end_label);
+         Label(true_label);
+         Li(dest_op, 1);
+         Label(end_label)], dest_op
+    | _ ->
+        full_ir @ [BinOp(final_op, dest_op, op1, op2)], dest_op (* 直接使用 op1 和 op2 *)
+    )
       )
 | Call (fname, args) ->
       (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
