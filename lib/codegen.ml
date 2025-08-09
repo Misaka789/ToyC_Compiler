@@ -821,47 +821,61 @@ and gen_stmts_ir_internal (env : cg_env) ?break_lbl ?cont_lbl (stmts : stmt list
 ;;
 
 (* MODIFIED: This function now correctly calculates stack size after generating the body IR. *)
+
 let gen_func_ir_internal (ana : analysis_result) (f : func_def) : ir list =
-  (* 1. Setup initial environment for parameters *)
-  let param_offset = ref (-8) in
-  let params_with_offsets =
-    List.mapi
-      (fun i name ->
-         param_offset := !param_offset - 4;
-         let offset = if i < 8 then !param_offset else 8 + ((i - 8) * 4) in
-         let reg_opt = if i < 8 then Some (Reg ("a" ^ string_of_int i)) else None in
-         name, offset, reg_opt)
+  (* 1. 为所有参数在当前函数（被调用者）的栈帧中分配一个本地存储位置。
+   *    同时也为保存 s 寄存器、ra、旧fp 预留空间。
+   *    我们将从 fp-8 开始向下分配。
+  *)
+  let local_storage_pos = ref (-8) in
+  (* fp 和 ra 的位置已被序言处理 *)
+  (* a. 为所有函数参数分配本地空间 *)
+  let param_to_local_offset_map =
+    List.fold_left
+      (fun map param_name ->
+         local_storage_pos := !local_storage_pos - 4;
+         VarEnv.add param_name !local_storage_pos map)
+      VarEnv.empty
       f.params
   in
-  let initial_var_map =
-    List.fold_left
-      (fun acc (name, offset, _) -> VarEnv.add name offset acc)
-      VarEnv.empty
-      params_with_offsets
-  in
-  (* 2. Create the initial generation environment *)
+  (* 2. 创建初始代码生成环境 *)
   let env =
     { funcs = ana.global_funcs
-    ; vars = [ initial_var_map ]
-    ; (* Start with one scope for parameters *)
-      stack_top = ref !param_offset
-    ; temp_counter = 0
+    ; vars = [ param_to_local_offset_map ]
+    ; (* 作用域栈从包含所有参数的本地位置开始 *)
+      stack_top = ref !local_storage_pos
+    ; (* 栈顶指针从参数之后开始 *)
+      temp_counter = 0
     ; label_counter = 0
-    ; current_function_name = f.fname (* INITIALIZE HERE *)
-    ; used_s_regs = [] (*初始话为空*)
+    ; current_function_name = f.fname
+    ; used_s_regs = []
     }
   in
-  (* 3. Generate the IR for the function body using the new helper. *)
-  let body_ir, final_env = gen_stmts_ir_internal env f.body in
-  (* 4. Save parameters from registers to stack *)
-  let params_save_ir =
-    List.filter_map
-      (function
-        | _, offset, Some reg -> Some (Store (reg, Stack offset))
-        | _ -> None)
-      params_with_offsets
+  (* 3. [核心修改] 生成代码，将所有传入的参数复制到它们在当前栈帧的本地位置 *)
+  let copy_params_to_local_frame_ir =
+    List.mapi
+      (fun i param_name ->
+         let dest_offset = VarEnv.find param_name param_to_local_offset_map in
+         if i < 8
+         then
+           (* 参数来自寄存器 a0-a7 *)
+           [ Store (Reg ("a" ^ string_of_int i), Stack dest_offset) ]
+         else (
+           (* 参数来自调用者的栈帧，相对于我们的 fp 是正向偏移 *)
+           let src_offset_from_fp = 8 + ((i - 8) * 4) in
+           let temp_reg = fresh_temp_reg env in
+           [ Load (temp_reg, Stack src_offset_from_fp)
+           ; (* 从调用者栈加载到临时寄存器 *)
+             Store (temp_reg, Stack dest_offset) (* 从临时寄存器存到我们的本地栈帧 *)
+           ]))
+      f.params
+    |> List.concat
   in
-  (* [新增] 生成保存/恢复 s 寄存器的IR *)
+  (* 重置临时寄存器计数器，因为上面的中转操作可能用掉了临时寄存器 *)
+  env.temp_counter <- 0;
+  (* 4. 生成函数体本身的IR *)
+  let body_ir, final_env = gen_stmts_ir_internal env f.body in
+  (* 5. 生成保存/恢复 s 寄存器的IR *)
   let s_regs_to_save = final_env.used_s_regs in
   let save_s_regs_ir =
     List.map
@@ -877,22 +891,25 @@ let gen_func_ir_internal (ana : analysis_result) (f : func_def) : ir list =
          Load (Reg reg_name, Stack offset))
       (List.rev s_regs_to_save)
   in
-  (* 5. Calculate final stack size using the final environment's stack_top. *)
-  let required_stack = abs !(final_env.stack_top) + 8 in
+  (* 6. 计算最终需要的总栈大小 *)
+  let required_stack_size = abs !(final_env.stack_top) in
+  (* 栈大小必须是16字节对齐的 *)
   let stack_size =
-    if required_stack mod 16 == 0
-    then required_stack
-    else required_stack + (16 - (required_stack mod 16))
+    if required_stack_size mod 16 == 0
+    then required_stack_size
+    else required_stack_size + (16 - (required_stack_size mod 16))
   in
-  (* 6. Assemble the full function IR *)
+  (* 7. 组装最终的、顺序正确的函数IR列表 *)
   [ Prologue (f.fname, stack_size) ]
   @ save_s_regs_ir
-  (* [添加一行] *)
-  @ params_save_ir
+  (* 首先保存 s 寄存器 *)
+  @ copy_params_to_local_frame_ir
+  (* 接着，将所有参数复制到本地栈帧 *)
   @ body_ir
+  (* 然后，执行函数体 *)
   @ restore_s_regs_ir
   @
-  (* [添加一行] *)
+  (* 返回前，恢复 s 寄存器 *)
   [ Epilogue (f.fname, stack_size) ]
 ;;
 
@@ -912,8 +929,8 @@ let ir_to_asm_list_internal (ir_instr : ir) : string list =
   | Li (dest, imm) -> [ Printf.sprintf "  li %s, %d" (op_to_str dest) imm ]
   | Move (dest, src) -> [ Printf.sprintf "  mv %s, %s" (op_to_str dest) (op_to_str src) ]
   | Load (dest, src) -> [ Printf.sprintf "  lw %s, %s" (op_to_str dest) (op_to_str src) ]
-  | Store (src, Stack i) when i < 0 ->
-    [ Printf.sprintf "  sw %s, %d(fp)" (op_to_str src) i ]
+  (* | Store (src, Stack i) when i < 0 ->
+    [ Printf.sprintf "  sw %s, %d(fp)" (op_to_str src) i ] *)
   | Store (src, Stack i) -> [ Printf.sprintf "  sw %s, %d(sp)" (op_to_str src) i ]
   | Store (src, dest) -> [ Printf.sprintf "  sw %s, %s" (op_to_str src) (op_to_str dest) ]
   | Jump s -> [ Printf.sprintf "  j %s" s ]
