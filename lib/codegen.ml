@@ -327,7 +327,7 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
   let params_with_offsets =
     List.mapi (fun i name ->
       param_offset := !param_offset - 4;
-      let offset = if i < 8 then !param_offset else 8 + (i - 8) * 4 in
+      let offset = if i < 8 then !param_offset else  (i - 8) * 4 in
       let reg_opt = if i < 8 then Some (Reg ("a" ^ string_of_int i)) else None in
       (name, offset, reg_opt)
     ) f.params
