@@ -1,95 +1,77 @@
-(* (* main.ml
-let () =
-  let input_file = Sys.argv.(1) in
-  let output_file = Sys.argv.(2) in
-  let in_channel = open_in input_file in
-  let lexbuf = Lexing.from_channel in_channel in
-  let ast = Parser.program Lexer.token lexbuf in
-  let asm_code = Codegen.generate_code ast in
-  let out_channel = open_out output_file in
-  output_string out_channel asm_code;
-  close_in in_channel;
-  close_out out_channel
-;;
-*)
 
-open Toyc_compiler_lib
-open Ast
+
+(* debug版本存档 *)
+
+
+(* open Toyc_compiler_lib
+
+(* 硬编码的文件名 *)
+(* let input_file = "17_complex_expressions.tc"    (* 输入文件名 *)
+let input_file = "18_many_variables.tc"
+let input_file = "19_many_arguments.tc"
+let input_file = "20_comprehensive.tc" *)
+let input_file = "test.tc"
+let output_file = "test.txt" (* 输出文件名 *)
+
+let read_file filename =
+  let ch = open_in filename in
+  let s = really_input_string ch (in_channel_length ch) in
+  close_in ch;
+  s
+
+let write_file filename content =
+  let ch = open_out filename in
+  output_string ch content;
+  close_out ch
 
 let () =
-  let test_case = "int main() { int x = 10; return x + 32; }" in
-  print_endline "======================================";
-  print_endline "Input source code:";
-  print_endline test_case;
-  print_endline "======================================";
-  (* 2. 从字符串创建词法分析缓冲区 *)
-  (* Lexing.from_string 是关键，它让我们可以不依赖文件 *)
-  let lexbuf = Lexing.from_string test_case in
+  let buffer = Buffer.create 1024 in
+  let append_to_buffer s = Buffer.add_string buffer (s ^ "\n") in
+  
   try
-    (* 3. 运行解析器并获取 AST *)
-    (* 这和从文件读取的调用方式完全一样 *)
+    (* 1. 读取输入文件 *)
+    let source_code = read_file input_file in
+    (* append_to_buffer ("Attempting to parse:\n---\n" ^ source_code ^ "\n---"); *)
+
+    (* 2. 词法分析 & 语法分析 *)
+    let lexbuf = Lexing.from_string source_code in
     let ast = Parser.program Lexer.token lexbuf in
-    (* 4. 打印出生成的 AST *)
-    print_endline "Parsing successful! Generated AST:";
-    print_endline "--------------------------------------";
-    print_endline (string_of_program ast);
-    print_endline "======================================"
+    append_to_buffer "Success! AST generated:";
+    append_to_buffer (Toyc_compiler_lib.Ast.string_of_program ast);
+
+    (* 3. 生成IR *)
+    let ir_code = Codegen.gen_program ast in
+    append_to_buffer "======================================";
+    append_to_buffer "Generated IR Code:";
+    append_to_buffer "--------------------------------------";
+    List.iter (fun instr -> append_to_buffer (Codegen.string_of_ir instr)) ir_code;
+    append_to_buffer "======================================";
+
+    (* 4. 生成汇编 *)
+    let assembly = Codegen.gen_assembly ir_code in
+    append_to_buffer "Generated Assembly:";
+    List.iter append_to_buffer assembly;
+
+    (* 5. 写入输出文件 *)
+    write_file output_file (Buffer.contents buffer);
+    print_endline ("Compilation completed. Results written to " ^ output_file)
+
   with
-  | Lexer.Error msg -> Printf.eprintf "Lexer error: %s\n" msg
-  | Parser.Error ->
-    let pos = lexbuf.Lexing.lex_curr_p in
-    Printf.eprintf
-      "Parser error at line %d, character %d\n"
-      pos.Lexing.pos_lnum
-      (pos.Lexing.pos_cnum - pos.Lexing.pos_bol)
-;;
-*)
-
-(* bin/main.ml - Debugging version *)
-
-
-open Toyc_compiler_lib
-(*
-let () =
-  let source_code = 
-    "int main() {
-    int x = 5;
-    if (x > 0) {
-        return 1;
-    }
-    return 0;
-}
-" in
-  Printf.printf "Attempting to parse:\n---\n%s\n---\n" source_code;
-  let lexbuf = Lexing.from_string source_code in
-  try
-    (* 用带命名空间的模块名 *)
-    (*生成ast*)
-    let ast = Parser.program Lexer.token lexbuf in
-    print_endline "Success! AST generated:";
-    print_endline (Toyc_compiler_lib.Ast.string_of_program ast);
-    (*ignore(Codegen.gen_program ast)*)
-    (*生成IR*)
-     let ir_code = Codegen.gen_program ast in
-    print_endline "======================================";
-    print_endline "Generated IR Code:";
-    print_endline "--------------------------------------";
-    (* 使用 Codegen.string_of_ir 将每条 IR 指令转换为字符串后再打印 *)
-    List.iter (fun instr -> print_endline (Codegen.string_of_ir instr)) ir_code;
-    print_endline "======================================";
-    (* 生成汇编 *)  
-    let assembly = Codegen.gen_assembly ir_code in  
-    print_endline "Generated Assembly:" ;
-    List.iter print_endline assembly  
-  with
-  | Toyc_compiler_lib.Lexer.Error msg -> Printf.eprintf "Lexer Error: %s\n" msg
+  | Sys_error msg -> 
+      append_to_buffer ("File error: " ^ msg);
+      write_file output_file (Buffer.contents buffer);
+      exit 1
+  | Toyc_compiler_lib.Lexer.Error msg ->
+      append_to_buffer ("Lexer Error: " ^ msg);
+      write_file output_file (Buffer.contents buffer);
+      exit 1
   | e ->
-    Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string e);
-    Printexc.print_backtrace stderr;
-    exit 1
-;;
+      append_to_buffer ("Unexpected error: " ^ Printexc.to_string e);
+      Printexc.print_backtrace stderr;
+      write_file output_file (Buffer.contents buffer);
+      exit 1
+  ;; *)
 
-*)
 
 let read_stdin_all () =
   let buf = Buffer.create 4096 in
