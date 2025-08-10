@@ -490,7 +490,7 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
           let compute_ir = [Printf.sprintf "  %s %s, %s, %d" (op_str_imm op) dest_reg r1 i] in
           let store_ir = if dest_reg = "t5" then store_from_reg "t5" dest else [] in
           load1_ir @ compute_ir @ store_ir
-      | Imm i, _ when op = Add || op = Mul -> (* Commutative ops *)
+     | Imm i, _ when op = IR_Add || op = IR_Mul  -> (* Commutative ops *)
           (* Swap operands to use immediate version *)
           let load2_ir, r2 = ensure_in_reg src2 "t5" in
           let dest_reg = match dest with Reg s -> s | _ -> "t5" in
