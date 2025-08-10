@@ -98,7 +98,7 @@ let optimize_program (p : program) : program = List.map optimize_func_def p
 
 (*实现窥孔优化*)
 (* 核心函数：递归地对IR列表进行窥孔优化 *)
-let rec optimize_ir (ir_list : ir list) : ir list =
+(* let rec optimize_ir (ir_list : ir list) : ir list =
   match ir_list with
   (* 模式1: 消除冗余跳转 (跳转到下一条指令) *)
   (*
@@ -141,4 +141,44 @@ let rec optimize_ir (ir_list : ir list) : ir list =
   | head :: tail -> head :: optimize_ir tail
   (* 列表为空，递归结束 *)
   | [] -> []
+;; *)
+
+(*以上窥孔优化性能没有得到提升 为17.76分*)
+let rec optimize_ir_one_pass (ir_list : ir list) : ir list =
+  match ir_list with
+  (* 模式1: 消除冗余跳转 *)
+  | Jump l1 :: Label l2 :: tail when l1 = l2 ->
+    (* 优化成功！我们丢弃了Jump指令。
+         重点：我们只对列表的 *尾部* (tail) 继续进行单次遍历，而不是从头再来！*)
+    optimize_ir_one_pass (Label l2 :: tail)
+  (* 模式2: 消除冗余的加载 *)
+  | Store (src, loc) :: Load (dest, same_loc) :: tail when loc = same_loc && src = dest ->
+    (* 优化成功！丢弃Load指令。继续处理尾部。*)
+    Store (src, loc) :: optimize_ir_one_pass tail
+  (* 模式3: 代数化简 (加0或乘1) *)
+  | BinOp (IR_Add, dest, src, Imm 0) :: tail | BinOp (IR_Sub, dest, src, Imm 0) :: tail ->
+    Move (dest, src) :: optimize_ir_one_pass tail
+  | BinOp (IR_Mul, dest, src, Imm 1) :: tail | BinOp (IR_Div, dest, src, Imm 1) :: tail ->
+    Move (dest, src) :: optimize_ir_one_pass tail
+  (* 模式4: 代数化简 (乘0) *)
+  | BinOp (IR_Mul, dest, _, Imm 0) :: tail -> Li (dest, 0) :: optimize_ir_one_pass tail
+  (* 如果当前指令头部没有匹配任何模式，则保留它，然后继续处理列表的尾部 *)
+  | head :: tail -> head :: optimize_ir_one_pass tail
+  (* 列表为空，递归结束 *)
+  | [] -> []
+;;
+
+(* 步骤2: 实现主循环函数，反复调用单次遍历直至代码不再变化 *)
+let optimize_ir (ir_code : ir list) : ir list =
+  (* 创建一个引用来保存上一次优化的结果 *)
+  let prev_ir = ref [] in
+  (* 创建一个引用来保存当前优化的结果 *)
+  let current_ir = ref ir_code in
+  (* 当上一次的结果和当前的结果不同时，就继续循环 *)
+  while !prev_ir <> !current_ir do
+    prev_ir := !current_ir;
+    current_ir := optimize_ir_one_pass !current_ir
+  done;
+  (* 循环结束，返回最终的优化结果 *)
+  !current_ir
 ;;
