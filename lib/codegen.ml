@@ -204,6 +204,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
                   )
               )
           )
+    )
 | Call (fname, args) ->
       (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
       let (eval_ir, arg_spill_locs_rev) =
