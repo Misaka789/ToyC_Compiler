@@ -2,8 +2,8 @@
 
 (* debug版本存档 *)
 
-
-(* open Toyc_compiler_lib
+open Toyc_compiler_lib
+(* 
 
 (* 硬编码的文件名 *)
 (* let input_file = "17_complex_expressions.tc"    (* 输入文件名 *)
