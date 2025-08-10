@@ -3,6 +3,10 @@
 open Ast
 open Semantic
 
+(**************一些优化函数的定义*******************)
+let is_small_imm i = i >= -2048 && i <= 2047
+(**********************************************)
+
 (*******************************************************************
  * 1. 中间表示 (Intermediate Representation) 和环境定义
  *******************************************************************)
@@ -133,64 +137,73 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       let var_loc = find_var_offset env x in
       rhs_ir @ [Store (rhs_op, Stack var_loc)], rhs_op
   | UnOp (op, expr) ->
-      let expr_ir, expr_op = gen_expr_ir_internal env expr in
-      let dest_reg = fresh_temp env in
-      expr_ir @ [UnOp (unop_from_ast_op op, dest_reg, expr_op)], dest_reg
-  | BinOp (op, e1, e2) ->
-      (match op with
-      | And ->
-          let dest_op = fresh_temp env in
-          let false_label = fresh_label env "L_false_" in
-          let end_label = fresh_label env "L_end_" in
-          let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0;
-          let ir2, op2 = gen_expr_ir_internal env e2 in
-          ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
-          [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
-      | Or ->
-          let dest_op = fresh_temp env in
-          let true_label = fresh_label env "L_true_" in
-          let end_label = fresh_label env "L_end_" in
-          let ir1, op1 = gen_expr_ir_internal env e1 in
-          env.temp_counter := 0;
-          let ir2, op2 = gen_expr_ir_internal env e2 in
-          ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
-          [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
-      
-      (* The robust "Spill-and-Reload" strategy, but this time with a correct assembler *)
+     (match expr with
+      (* Constant Folding for Unary Operators *)
+      | IntLiteral n ->
+          let result = match op with
+            | Neg -> -n
+            | Not -> if n = 0 then 1 else 0
+          in
+          let temp_op = fresh_temp env in
+          [Li(temp_op, result)], temp_op
       | _ ->
-          (* This order of evaluation (e1 then e2) is more conventional *)
-          let ir1, op1 = gen_expr_ir_internal env e1 in
-          let temp_slot_for_op1 = alloc_temp_stack_slot env in
-          let save_ir = [Store(op1, temp_slot_for_op1)] in
-          
-          env.temp_counter := 0; (* Reset temps for the other side *)
-          
-          let ir2, op2 = gen_expr_ir_internal env e2 in
-          
-          let loaded_op1 = fresh_temp env in
-          let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
-          
+          let expr_ir, expr_op = gen_expr_ir_internal env expr in
           let dest_op = fresh_temp env in
-          let final_op = binop_from_ast_op op in
-          
-          let full_ir = ir1 @ save_ir @ ir2 @ load_ir in
-          
-          (match final_op with
-          | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
-              let true_label = fresh_label env "L_true_" in
-              let end_label = fresh_label env "L_end_" in
-              full_ir @
-              [Li(dest_op, 0);
-               Branch(final_op, loaded_op1, op2, true_label);
-               Jump(end_label);
-               Label(true_label);
-               Li(dest_op, 1);
-               Label(end_label)], dest_op
+          expr_ir @ [UnOp (unop_from_ast_op op, dest_op, expr_op)], dest_op)
+  | BinOp (op, e1, e2) ->
+    (match e1, e2 with
+      (* OPTIMIZATION: Constant Folding *)
+      | IntLiteral n1, IntLiteral n2 ->
+          let result = match op with
+            | Add -> n1 + n2  | Sub -> n1 - n2  | Mul -> n1 * n2
+            | Div -> if n2 = 0 then 0 else n1 / n2 (* Avoid division by zero *)
+            | Mod -> if n2 = 0 then 0 else n1 mod n2
+            | Eq  -> if n1 = n2 then 1 else 0   | Neq -> if n1 <> n2 then 1 else 0
+            | Lt  -> if n1 < n2 then 1 else 0   | Le  -> if n1 <= n2 then 1 else 0
+            | Gt  -> if n1 > n2 then 1 else 0   | Ge  -> if n1 >= n2 then 1 else 0
+            | And -> if n1 <> 0 && n2 <> 0 then 1 else 0
+            | Or  -> if n1 <> 0 || n2 <> 0 then 1 else 0
+          in
+          let temp_op = fresh_temp env in
+          [Li (temp_op, result)], temp_op
+     | _, _ -> (* Original BinOp logic if not both are literals *)
+        (match op with
+          | And | Or -> (* These are already handled, just to be explicit *)
+              (* This logic can be copied from your current file *)
+              failwith "Should have been handled"
+
+          (* OPTIMIZATION: Smart BinOp generation *)
           | _ ->
-              full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
+              let ir1, op1 = gen_expr_ir_internal env e1 in
+              (* If the right operand is a simple integer, we can often use an immediate instruction *)
+              (match e2 with
+              | IntLiteral n when (is_small_imm n && (op = Add || op = Sub)) ->
+                  let dest_op = fresh_temp env in
+                  let final_op = binop_from_ast_op op in
+                  ir1 @ [BinOp(final_op, dest_op, op1, Imm n)], dest_op
+              | _ ->
+                  (* Fallback to the robust Spill-and-Reload strategy if e2 is complex *)
+                  let temp_slot_for_op1 = alloc_temp_stack_slot env in
+                  let save_ir = [Store(op1, temp_slot_for_op1)] in
+                  env.temp_counter := 0;
+                  let ir2, op2 = gen_expr_ir_internal env e2 in
+                  let loaded_op1 = fresh_temp env in
+                  let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
+                  let dest_op = fresh_temp env in
+                  let final_op = binop_from_ast_op op in
+                  let full_ir = ir1 @ save_ir @ ir2 @ load_ir in
+                  (match final_op with
+                  | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
+                      let true_label = fresh_label env "L_true_" in
+                      let end_label = fresh_label env "L_end_" in
+                      full_ir @
+                      [Li(dest_op, 0); Branch(final_op, loaded_op1, op2, true_label);
+                       Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
+                  | _ ->
+                      full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
+                  )
+              )
           )
-      )
 | Call (fname, args) ->
       (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
       let (eval_ir, arg_spill_locs_rev) =
@@ -375,171 +388,6 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
  * 3. 从 IR 到 RISC-V 汇编的转换 (内部函数)
  *******************************************************************)
 
-(* In Section 3 - FINAL, CORRECTED VERSION of ir_to_asm_list_internal *)
-
-(* let ir_to_asm_list_internal (ir_instr: ir) : string list =
-  let is_small_imm i = i >= -2048 && i <= 2047 in
-  let emit_mem_access op_str reg_name offset base_reg =
-    if is_small_imm offset then
-      [Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg]
-    else
-      [Printf.sprintf "  li t6, %d" offset;
-       Printf.sprintf "  add t6, %s, t6" base_reg;
-       Printf.sprintf "  %s %s, 0(t6)" op_str reg_name]
-  in
-  let ensure_in_reg op target_reg =
-    match op with
-    | Reg s ->
-        if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
-    | Stack i ->
-        emit_mem_access "lw" target_reg i "fp", target_reg
-    | Imm i ->
-        [Printf.sprintf "  li %s, %d" target_reg i], target_reg
-  in
-  let store_from_reg src_reg dest_op =
-    match dest_op with
-    | Reg s ->
-        if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
-    | Stack i ->
-        emit_mem_access "sw" src_reg i "fp"
-    | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
-  in
-
-  match ir_instr with
-  | Label s -> [s ^ ":"]
-  | Li (dest, imm) ->
-      let load_imm_ir = [Printf.sprintf "  li t6, %d" imm] in
-      let store_ir = store_from_reg "t6" dest in
-      load_imm_ir @ store_ir
-  | Move (dest, src) ->
-      let load_ir, src_reg_name = ensure_in_reg src "t6" in
-      let store_ir = store_from_reg src_reg_name dest in
-      load_ir @ store_ir
-  | Load (dest, src) ->
-      (* RESTORED: Load is only for fp-relative access *)
-      (match src with
-      | Stack i ->
-          let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
-          let store_dest_ir = store_from_reg "t6" dest in
-          load_val_ir @ store_dest_ir
-      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location")
-  | Store (src, dest) ->
-      (match dest with
-      | Stack i ->
-          let load_src_ir, src_reg = ensure_in_reg src "t6" in
-          let store_ir = emit_mem_access "sw" src_reg i "fp" in
-          load_src_ir @ store_ir
-      | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location")
-  | StoreOutArg (src, offset) ->
-      let load_src_ir, src_reg = ensure_in_reg src "t6" in
-      let store_ir = emit_mem_access "sw" src_reg offset "sp" in
-      load_src_ir @ store_ir
-  | UnOp (op, dest, src) ->
-      let op_str = match op with IR_Neg -> "neg" | IR_Not -> "seqz" in
-      let load_ir, src_reg = ensure_in_reg src "t6" in
-      let compute_ir = [Printf.sprintf "  %s t6, %s" op_str src_reg] in
-      let store_ir = store_from_reg "t6" dest in
-      load_ir @ compute_ir @ store_ir
-      
-  (*** NEW, ROBUST BinOp ASSEMBLY LOGIC ***)
-  | BinOp (op, dest, src1, src2) ->
-      let op_str = match op with | IR_Add -> "add" | IR_Sub -> "sub" | IR_Mul -> "mul" | IR_Div -> "div" | IR_Mod -> "rem" | _ -> failwith "Invalid op for BinOp" in
-      
-      (* Step 1: Safely load src1 and src2 into t5 and t6, avoiding clobbering. *)
-      let load_ir, r1, r2 =
-        match src1, src2 with
-        (* If both are already registers, just use them. *)
-        | Reg r1, Reg r2 -> [], r1, r2
-        (* If one is a register and the other is not, load the non-reg one. *)
-        | Reg r1, other ->
-            let load2_ir, r2 = ensure_in_reg other "t6" in
-            load2_ir, r1, r2
-        | other, Reg r2 ->
-            let load1_ir, r1 = ensure_in_reg other "t5" in
-            load1_ir, r1, r2
-        (* If neither are registers, load both. *)
-        | other1, other2 ->
-            let load1_ir, r1 = ensure_in_reg other1 "t5" in
-            let load2_ir, r2 = ensure_in_reg other2 "t6" in
-            load1_ir @ load2_ir, r1, r2
-      in
-      
-      (* Step 2: Perform the computation, placing result in t5. *)
-      let compute_ir = [Printf.sprintf "  %s t5, %s, %s" op_str r1 r2] in
-      
-      (* Step 3: Store the result from t5 to the final destination. *)
-      let store_ir = store_from_reg "t5" dest in
-      
-      load_ir @ compute_ir @ store_ir
-  | BranchZ (src, label) ->
-      let load_ir, reg = ensure_in_reg src "t6" in
-      load_ir @ [Printf.sprintf "  beqz %s, %s" reg label]
-  | BranchNZ (src, label) ->
-      let load_ir, reg = ensure_in_reg src "t6" in
-      load_ir @ [Printf.sprintf "  bnez %s, %s" reg label]    
-      
-      
-  | Branch (op, src1, src2, label) ->
-      (* This logic can also be made safer, similar to BinOp *)
-      let branch_op_str = match op with | IR_Eq -> "beq" | IR_Neq -> "bne" | IR_Lt -> "blt" | IR_Le -> "ble" | IR_Gt -> "bgt" | IR_Ge -> "bge" | _ -> failwith "Invalid op for Branch" in
-      let load_ir, r1, r2 =
-        match src1, src2 with
-        | Reg r1, Reg r2 -> [], r1, r2
-        | Reg r1, other -> let load2_ir, r2 = ensure_in_reg other "t6" in load2_ir, r1, r2
-        | other, Reg r2 -> let load1_ir, r1 = ensure_in_reg other "t5" in load1_ir, r1, r2
-        | other1, other2 ->
-            let load1_ir, r1 = ensure_in_reg other1 "t5" in
-            let load2_ir, r2 = ensure_in_reg other2 "t6" in
-            load1_ir @ load2_ir, r1, r2
-      in
-      let branch_ir = [Printf.sprintf "  %s %s, %s, %s" branch_op_str r1 r2 label] in
-      load_ir @ branch_ir
-
-  (* ... All other cases from PreCall to Epilogue remain the same as the last version ... *)
-  | Jump s -> [Printf.sprintf "  j %s" s]
-  | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
-  | PreCall (stack_space) ->
-      if stack_space > 0 then
-        (if is_small_imm (-stack_space) then [Printf.sprintf "  addi sp, sp, -%d" stack_space]
-         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  sub sp, sp, t6"])
-      else []
-  | Call s ->
-      [Printf.sprintf "  call %s" s]
-  | PostCall (stack_space) ->
-      if stack_space > 0 then
-        (if is_small_imm stack_space then [Printf.sprintf "  addi sp, sp, %d" stack_space]
-         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  add sp, sp, t6"])
-      else []
-  | Prologue (fname, stack_size) ->
-      let setup_sp =
-        if is_small_imm (-stack_size) then
-          [Printf.sprintf "  addi sp, sp, -%d" stack_size]
-        else
-          [Printf.sprintf "  li t6, %d" stack_size;
-           Printf.sprintf "  sub sp, sp, t6"]
-      in
-      let save_ra = emit_mem_access "sw" "ra" (stack_size - 4) "sp" in
-      let save_fp = emit_mem_access "sw" "fp" (stack_size - 8) "sp" in
-      let setup_fp =
-        if is_small_imm stack_size then
-          [Printf.sprintf "  addi fp, sp, %d" stack_size]
-        else
-          [Printf.sprintf "  li t6, %d" stack_size;
-           Printf.sprintf "  add fp, sp, t6"]
-      in
-      [".text"; ".globl " ^ fname; fname ^ ":"] @ setup_sp @ save_ra @ save_fp @ setup_fp
-  | Epilogue (fname, stack_size) ->
-      let restore_fp = emit_mem_access "lw" "fp" (stack_size - 8) "sp" in
-      let restore_ra = emit_mem_access "lw" "ra" (stack_size - 4) "sp" in
-      let teardown_sp =
-        if is_small_imm stack_size then
-          [Printf.sprintf "  addi sp, sp, %d" stack_size]
-        else
-          [Printf.sprintf "  li t6, %d" stack_size;
-           Printf.sprintf "  add sp, sp, t6"]
-      in
-      [".L_ret_" ^ fname ^ ":"] @ restore_fp @ restore_ra @ teardown_sp @ ["  ret"] *)
-
   let ir_to_asm_list_internal (ir_instr: ir) : string list =
   let is_small_imm i = i >= -2048 && i <= 2047 in
   let emit_mem_access op_str reg_name offset base_reg =
@@ -587,9 +435,17 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
       let store_ir = store_from_reg "t6" dest in
       load_imm_ir @ store_ir
   | Move (dest, src) ->
-      let load_ir, src_reg_name = ensure_in_reg src "t6" in
-      let store_ir = store_from_reg src_reg_name dest in
-      load_ir @ store_ir 
+      (match dest, src with
+      (* OPTIMIZATION: Avoid redundant moves like mv t0, t0 *)
+      | Reg d, Reg s when d = s -> []
+      (* OPTIMIZATION: Direct load/store instead of load/move or move/store *)
+      | Reg d, Stack s_off -> emit_mem_access "lw" d s_off "fp"
+      | Stack d_off, Reg s -> emit_mem_access "sw" s d_off "fp"
+      | _, _ ->
+          (* Fallback for other cases like Stack-to-Stack moves *)
+          let load_ir, src_reg_name = ensure_in_reg src "t6" in
+          let store_ir = store_from_reg src_reg_name dest in
+          load_ir @ store_ir)
   | Load (dest, src) ->
       (match src with
       | Stack i ->
@@ -617,24 +473,46 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
 
   (*** MODIFIED, ROBUST BinOp ASSEMBLY LOGIC ***)
   | BinOp (op, dest, src1, src2) ->
-      stack_temp_counter := 0; (* Reset temp register pool for each instruction *)
-      let op_str = match op with
-        | IR_Add -> "add"  | IR_Sub -> "sub"  | IR_Mul -> "mul"  | IR_Div -> "div"  | IR_Mod -> "rem" 
-        | _ -> failwith "Invalid op for BinOp" 
+       (* stack_temp_counter := 0;Reset temp register pool for each instruction *)
+      let op_str_imm op = match op with
+        | IR_Add -> "addi" | IR_Sub -> "subi" | _ -> ""
       in
+      let op_str op = match op with
+        | IR_Add -> "add" | IR_Sub -> "sub" | IR_Mul -> "mul"
+        | IR_Div -> "div" | IR_Mod -> "rem" | _ -> failwith "Invalid op for BinOp"
+      in
+      (match src1, src2 with
+      (* OPTIMIZATION: Handle immediate operands *)
+      | _, Imm i when op_str_imm op <> "" ->
+          let load1_ir, r1 = ensure_in_reg src1 "t5" in
+          let dest_reg = match dest with Reg s -> s | _ -> "t5" in
+          let compute_ir = [Printf.sprintf "  %s %s, %s, %d" (op_str_imm op) dest_reg r1 i] in
+          let store_ir = if dest_reg = "t5" then store_from_reg "t5" dest else [] in
+          load1_ir @ compute_ir @ store_ir
+      | Imm i, _ when op = Add || op = Mul -> (* Commutative ops *)
+          (* Swap operands to use immediate version *)
+          let load2_ir, r2 = ensure_in_reg src2 "t5" in
+          let dest_reg = match dest with Reg s -> s | _ -> "t5" in
+          let compute_ir = [Printf.sprintf "  %s %s, %s, %d" (op_str_imm op) dest_reg r2 i] in
+          let store_ir = if dest_reg = "t5" then store_from_reg "t5" dest else [] in
+          load2_ir @ compute_ir @ store_ir
 
-      (* 1. Safely load both source operands into dedicated temp registers (t4, t5) *)
-      let (load1_ir, r1) = load_operand_to_temp src1 in
-      let (load2_ir, r2) = load_operand_to_temp src2 in
-
-      (* 2. Get a third temp register (t6) to store the result of the computation *)
-      let result_reg = match get_stack_temp_reg () with Reg s -> s | _ -> failwith "impossible" in
-      let compute_ir = [Printf.sprintf "  %s %s, %s, %s" op_str result_reg r1 r2] in
-
-      (* 3. Store the result from the temp register to the final destination *)
-      let store_ir = store_from_reg result_reg dest in
-
-      load1_ir @ load2_ir @ compute_ir @ store_ir
+      (* Original robust logic as fallback *)
+      | _, _ ->
+          let load_ir, r1, r2 =
+            match src1, src2 with
+            | Reg r1, Reg r2 -> [], r1, r2
+            | Reg r1, other -> let load2_ir, r2 = ensure_in_reg other "t6" in load2_ir, r1, r2
+            | other, Reg r2 -> let load1_ir, r1 = ensure_in_reg other "t5" in load1_ir, r1, r2
+            | other1, other2 ->
+                let load1_ir, r1 = ensure_in_reg other1 "t5" in
+                let load2_ir, r2 = ensure_in_reg other2 "t6" in
+                load1_ir @ load2_ir, r1, r2
+          in
+          let compute_ir = [Printf.sprintf "  %s t5, %s, %s" (op_str op) r1 r2] in
+          let store_ir = store_from_reg "t5" dest in
+          load_ir @ compute_ir @ store_ir
+      )
 
   | BranchZ (src, label) ->
       let load_ir, reg = ensure_in_reg src "t6" in
