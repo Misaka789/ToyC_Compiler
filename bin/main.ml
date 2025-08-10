@@ -87,9 +87,11 @@ let () =
   try
     let ast = Parser.program Lexer.token lexbuf in
     (*调用优化函数*)
-    let optimized_ast = Codegen.optimize_program ast in
+    let optimized_ast = Optimize.optimize_program ast in
     let ir_code = Codegen.gen_program optimized_ast in
-    let assembly = Codegen.gen_assembly ir_code in
+    (*应用窥孔优化*)
+    let optimized_ir = Optimize.optimize_ir ir_code in
+    let assembly = Codegen.gen_assembly optimized_ir in
     List.iter print_endline assembly
   with
   | Toyc_compiler_lib.Lexer.Error msg -> prerr_endline ("Lexer Error: " ^ msg)
