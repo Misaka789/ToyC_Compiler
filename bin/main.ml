@@ -81,7 +81,7 @@ let read_stdin_all () =
   | End_of_file -> Buffer.contents buf
 ;;
 
-let () =
+(* let () =
   let source_code = read_stdin_all () in
   let lexbuf = Lexing.from_string source_code in
   try
@@ -93,6 +93,36 @@ let () =
     let optimized_ir = Optimize.optimize_ir ir_code in
     let assembly = Codegen.gen_assembly optimized_ir in
     List.iter print_endline assembly
+  with
+  | Toyc_compiler_lib.Lexer.Error msg -> prerr_endline ("Lexer Error: " ^ msg)
+  | e ->
+    prerr_endline ("Unexpected error: " ^ Printexc.to_string e);
+    Printexc.print_backtrace stderr;
+    exit 1
+;; *)
+let () =
+  (* 1. 读取和解析源代码 -> AST *)
+  let source_code = read_stdin_all () in
+  let lexbuf = Lexing.from_string source_code in
+  try
+    let ast = Parser.program Lexer.token lexbuf in
+    (* 2. AST 级别的优化 (例如常量折叠) *)
+    let optimized_ast = Optimize.optimize_program ast in
+    (* 3. 语义分析 (如果需要传递分析结果的话) *)
+    let analysis_result = Semantic.analyze_program optimized_ast in
+    (*
+       * 4. 核心改动：遍历每个函数，并为每个函数独立生成汇编
+     *    我们使用 List.concat_map 来处理每个函数并把结果拼接起来
+    *)
+    let final_assembly =
+      List.concat_map
+        (fun func_def ->
+           (* 为当前函数调用新的、完整的代码生成流程 *)
+           Codegen.gen_assembly_for_function func_def analysis_result)
+        optimized_ast (* optimized_ast 就是 program 类型，即 func_def list *)
+    in
+    (* 5. 打印最终拼接好的汇编代码 *)
+    List.iter print_endline final_assembly
   with
   | Toyc_compiler_lib.Lexer.Error msg -> prerr_endline ("Lexer Error: " ^ msg)
   | e ->
