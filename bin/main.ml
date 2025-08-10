@@ -1,11 +1,8 @@
-
-
 (* debug版本存档 *)
 
 open Toyc_compiler_lib
-(* 
-
-(* 硬编码的文件名 *)
+(*
+   (* 硬编码的文件名 *)
 (* let input_file = "17_complex_expressions.tc"    (* 输入文件名 *)
 let input_file = "18_many_variables.tc"
 let input_file = "19_many_arguments.tc"
@@ -72,7 +69,6 @@ let () =
       exit 1
   ;; *)
 
-
 let read_stdin_all () =
   let buf = Buffer.create 4096 in
   try
@@ -81,25 +77,24 @@ let read_stdin_all () =
       Buffer.add_char buf '\n'
     done;
     Buffer.contents buf
-  with End_of_file ->
-    Buffer.contents buf
+  with
+  | End_of_file -> Buffer.contents buf
+;;
 
 let () =
   let source_code = read_stdin_all () in
   let lexbuf = Lexing.from_string source_code in
   try
     let ast = Parser.program Lexer.token lexbuf in
-    let ir_code = Codegen.gen_program ast in
+    (*调用优化函数*)
+    let optimized_ast = Codegen.optimize_program ast in
+    let ir_code = Codegen.gen_program optimized_ast in
     let assembly = Codegen.gen_assembly ir_code in
     List.iter print_endline assembly
   with
-  | Toyc_compiler_lib.Lexer.Error msg ->
-      prerr_endline ("Lexer Error: " ^ msg)
+  | Toyc_compiler_lib.Lexer.Error msg -> prerr_endline ("Lexer Error: " ^ msg)
   | e ->
-      prerr_endline ("Unexpected error: " ^ Printexc.to_string e);
-      Printexc.print_backtrace stderr;
-      exit 1
-
-
-
-
+    prerr_endline ("Unexpected error: " ^ Printexc.to_string e);
+    Printexc.print_backtrace stderr;
+    exit 1
+;;
