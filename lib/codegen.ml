@@ -3,10 +3,6 @@
 open Ast
 open Semantic
 
-(**************一些优化函数的定义*******************)
-let is_small_imm i = i >= -2048 && i <= 2047
-(**********************************************)
-
 (*******************************************************************
  * 1. 中间表示 (Intermediate Representation) 和环境定义
  *******************************************************************)
@@ -119,39 +115,27 @@ let unop_from_ast_op op =
   | Neg -> IR_Neg | Not -> IR_Not
 
 (*******************************************************************
- * 2. 从 AST 到 IR 的转换 (内部函数)
- *******************************************************************)
+ * OPTIMIZATION PASS (NEW SECTION)
+ *******************************************************************)
 
- 
-let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
+(* This new function performs optimizations directly on the AST,
+   before any IR is generated. This is a safe and powerful approach. *)
+let rec optimize_expr (e: expr) : expr =
   match e with
-  | IntLiteral n ->
-      let temp_reg = fresh_temp env in
-      [Li (temp_reg, n)], temp_reg
-  | Id x ->
-      let var_loc = find_var_offset env x in
-      let temp_reg = fresh_temp env in
-      [Load (temp_reg, Stack var_loc)], temp_reg
-  | Assign (x, rhs_expr) ->
-      let rhs_ir, rhs_op = gen_expr_ir_internal env rhs_expr in
-      let var_loc = find_var_offset env x in
-      rhs_ir @ [Store (rhs_op, Stack var_loc)], rhs_op
-  | UnOp (op, expr) ->
-     (match expr with
-      (* Constant Folding for Unary Operators *)
-      | IntLiteral n ->
-          let result = match op with
-            | Neg -> -n
-            | Not -> if n = 0 then 1 else 0
-          in
-          let temp_op = fresh_temp env in
-          [Li(temp_op, result)], temp_op
-      | _ ->
-          let expr_ir, expr_op = gen_expr_ir_internal env expr in
-          let dest_op = fresh_temp env in
-          expr_ir @ [UnOp (unop_from_ast_op op, dest_op, expr_op)], dest_op)
-  | BinOp (op, e1, e2) ->
-     (match op, e1, e2 with
+  (* First, recursively optimize the children of the expression *)
+  | UnOp(op, e1) ->
+      let e1' = optimize_expr e1 in
+      (match op, e1' with
+      (* Constant Folding *)
+      | Neg, IntLiteral n -> IntLiteral (-n)
+      | Not, IntLiteral n -> IntLiteral (if n = 0 then 1 else 0)
+      (* Identity: !!x = x *)
+      | Not, UnOp(Not, e_inner) -> e_inner
+      | _, _ -> UnOp(op, e1'))
+  | BinOp(op, e1, e2) ->
+      let e1' = optimize_expr e1 in
+      let e2' = optimize_expr e2 in
+      (match op, e1', e2' with
       (* Constant Folding *)
       | _, IntLiteral n1, IntLiteral n2 ->
           let result = match op with
@@ -164,62 +148,82 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
             | And -> if n1 <> 0 && n2 <> 0 then 1 else 0
             | Or  -> if n1 <> 0 || n2 <> 0 then 1 else 0
           in
-          let temp_op = fresh_temp env in
-          [Li (temp_op, result)], temp_op
-      
+          IntLiteral result
       (* Algebraic Simplification *)
-      | (Add | Sub), _, IntLiteral 0 -> gen_expr_ir_internal env e1
-      | Add, IntLiteral 0, _ -> gen_expr_ir_internal env e2
-      | (Mul | Div), _, IntLiteral 1 -> gen_expr_ir_internal env e1
-      | Mul, IntLiteral 1, _ -> gen_expr_ir_internal env e2
-      | Mul, _, IntLiteral 0 -> [Li (fresh_temp env, 0)], Imm 0
-      | Mul, IntLiteral 0, _ -> [Li (fresh_temp env, 0)], Imm 0
+      | (Add | Sub), e, IntLiteral 0 -> e
+      | Add, IntLiteral 0, e -> e
+      | (Mul | Div), e, IntLiteral 1 -> e
+      | Mul, IntLiteral 1, e -> e
+      | Mul, _, IntLiteral 0 -> IntLiteral 0
+      | Mul, IntLiteral 0, _ -> IntLiteral 0
+      (* Return the expression with optimized children if no rule applies *)
+      | _, _, _ -> BinOp(op, e1', e2'))
+  | Call(fname, args) -> Call(fname, List.map optimize_expr args)
+  | Assign(x, rhs) -> Assign(x, optimize_expr rhs)
+  | Id _ | IntLiteral _ -> e (* Base cases, no change *)
+
+(*******************************************************************
+ * 2. 从 AST 到 IR 的转换 (内部函数)
+ *******************************************************************)
+
+ 
+let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
+  let e = optimize_expr e in
+  match e with
+  | IntLiteral n ->
+      let temp_reg = fresh_temp env in
+      [Li (temp_reg, n)], temp_reg
+  | Id x ->
+      let var_loc = find_var_offset env x in
+      let temp_reg = fresh_temp env in
+      [Load (temp_reg, Stack var_loc)], temp_reg
+  | Assign (x, rhs_expr) ->
+      let rhs_ir, rhs_op = gen_expr_ir_internal env rhs_expr in
+      let var_loc = find_var_offset env x in
+      rhs_ir @ [Store (rhs_op, Stack var_loc)], rhs_op
+   | UnOp (op, expr) ->
+      let expr_ir, expr_op = gen_expr_ir_internal env expr in
+      let dest_op = fresh_temp env in
+      expr_ir @ [UnOp (unop_from_ast_op op, dest_op, expr_op)], dest_op
+  | BinOp (op, e1, e2) ->
+      (match op with
+      | And ->
+          let dest_op = fresh_temp env in
+          let false_label = fresh_label env "L_false_" in
+          let end_label = fresh_label env "L_end_" in
+          let ir1, op1 = gen_expr_ir_internal env e1 in
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
+          [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
+      | Or ->
+          let dest_op = fresh_temp env in
+          let true_label = fresh_label env "L_true_" in
+          let end_label = fresh_label env "L_end_" in
+          let ir1, op1 = gen_expr_ir_internal env e1 in
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
+          [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
 
        (* DEFAULT LOGIC: If no optimization applies, use the robust methods *)
-       | _, _, _ ->
-          (match op with
-          | And ->
-              let dest_op = fresh_temp env in
-              let false_label = fresh_label env "L_false_" in
-              let end_label = fresh_label env "L_end_" in
-              let ir1, op1 = gen_expr_ir_internal env e1 in
-              let ir2, op2 = gen_expr_ir_internal env e2 in
-              ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
-              [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
-          | Or ->
-              let dest_op = fresh_temp env in
+         | _ ->
+          let ir1, op1 = gen_expr_ir_internal env e1 in
+          let temp_slot_for_op1 = alloc_temp_stack_slot env in
+          let save_ir = [Store(op1, temp_slot_for_op1)] in
+          let ir2, op2 = gen_expr_ir_internal env e2 in
+          let loaded_op1 = fresh_temp env in
+          let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
+          let dest_op = fresh_temp env in
+          let final_op = binop_from_ast_op op in
+          let full_ir = ir1 @ save_ir @ ir2 @ load_ir in
+          (match final_op with
+          | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
               let true_label = fresh_label env "L_true_" in
               let end_label = fresh_label env "L_end_" in
-              let ir1, op1 = gen_expr_ir_internal env e1 in
-              let ir2, op2 = gen_expr_ir_internal env e2 in
-              ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
-              [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
-         
+              full_ir @
+              [Li(dest_op, 0); Branch(final_op, loaded_op1, op2, true_label);
+               Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
           | _ ->
-              let ir1, op1 = gen_expr_ir_internal env e1 in
-              let temp_slot_for_op1 = alloc_temp_stack_slot env in
-              let save_ir = [Store(op1, temp_slot_for_op1)] in
-              
-              let ir2, op2 = gen_expr_ir_internal env e2 in
-              
-              let loaded_op1 = fresh_temp env in
-              let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
-              
-              let dest_op = fresh_temp env in
-              let final_op = binop_from_ast_op op in
-              
-              let full_ir = ir1 @ save_ir @ ir2 @ load_ir in
-              
-              (match final_op with
-              | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
-                  let true_label = fresh_label env "L_true_" in
-                  let end_label = fresh_label env "L_end_" in
-                  full_ir @
-                  [Li(dest_op, 0); Branch(final_op, loaded_op1, op2, true_label);
-                   Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
-              | _ ->
-                  full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
-              )
+              full_ir @ [BinOp(final_op, dest_op, loaded_op1, op2)], dest_op
           )
       )
 | Call (fname, args) ->
