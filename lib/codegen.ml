@@ -401,26 +401,25 @@ type stack_layout =
  * @param stack_layout 栈布局信息 (我们稍后会定义)
  * @return 生成的汇编指令列表
 *)
-let ensure_in_reg op target_reg alloc_map stack_layout =
+let ensure_in_reg op target_reg alloc_map _ =
   match op with
   | Imm i -> [ Printf.sprintf "  li %s, %d" target_reg i ]
   | Reg r ->
-    (* 这已经是一个物理寄存ator了，可能是 "a0" 或 "fp" *)
+    (* 已经是物理寄存器 *)
     if r <> target_reg then [ Printf.sprintf "  mv %s, %s" target_reg r ] else []
   | VReg v ->
-    (* 核心逻辑：处理虚拟寄存器 *)
+    (* 虚拟寄存器，需要查找分配结果 *)
     (match IntMap.find v alloc_map with
      | PhysicalReg reg_name ->
-       (* 分配到了物理寄存器，直接移动过来 *)
        if reg_name <> target_reg
        then [ Printf.sprintf "  mv %s, %s" target_reg reg_name ]
        else []
      | Spilled offset ->
-       (* 被溢出到栈上，需要从栈加载 *)
-       (* 我们需要知道总的栈大小来正确计算偏移量 *)
-       let final_offset = -(stack_layout.total_size - offset) in
-       [ Printf.sprintf "  lw %s, %d(fp)" target_reg final_offset ])
-  | Stack _ -> failwith "Stack operand should not appear in vreg IR"
+       (* 之前被溢出到栈上，现在需要加载回来 *)
+       [ Printf.sprintf "  lw %s, %d(fp)" target_reg offset ])
+  | Stack fp_offset ->
+    (* 新增分支：直接从本地变量的栈位置加载 *)
+    [ Printf.sprintf "  lw %s, %d(fp)" target_reg fp_offset ]
 ;;
 
 (*
