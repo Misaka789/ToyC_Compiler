@@ -163,11 +163,12 @@ let vreg_of_op op =
   match op with
   | VReg i -> Some i
   | Reg s ->
+    (* 只有 t0-tN 被视为虚拟寄存器，a0-a7 等不是 *)
     if String.starts_with ~prefix:"t" s
     then (
       try Some (int_of_string (String.sub s 1 (String.length s - 1))) with
-      | _ -> None)
-    else None
+      | Failure _ -> None (* int_of_string 失败时返回 None *))
+    else None (* a0, fp, sp 等都不是虚拟寄存器 *)
   | _ -> None
 ;;
 
@@ -430,20 +431,36 @@ let ensure_in_reg op target_reg alloc_map stack_layout =
  * @param stack_layout 栈布局信息
  * @return 生成的汇编指令列表
 *)
-let store_from_reg src_reg dest_op alloc_map stack_layout =
+let store_from_reg src_reg dest_op alloc_map _ =
   match dest_op with
+  (* 情况1: 目标是虚拟寄存器 *)
   | VReg v ->
     (match IntMap.find v alloc_map with
      | PhysicalReg reg_name ->
-       (* 目标是物理寄存器，移动过去 *)
        if src_reg <> reg_name
        then [ Printf.sprintf "  mv %s, %s" reg_name src_reg ]
        else []
      | Spilled offset ->
-       (* 目标在栈上，存回去 *)
-       let final_offset = -(stack_layout.total_size - offset) in
-       [ Printf.sprintf "  sw %s, %d(fp)" src_reg final_offset ])
-  | _ -> failwith "Destination of computation must be a virtual register"
+       (* 之前这里的偏移量计算可能有问题，我们修正一下 *)
+       (* 假设 offset 是从 -4 开始递减的。它代表相对于 spill_base 的偏移 *)
+       (* 而 spill_base 是相对于 fp 的。我们假设本地变量在-8, -12...，溢出变量在它们之后 *)
+       (* 这是一个简化的假设，更健壮的实现需要更详细的栈帧信息 *)
+       [ Printf.sprintf "  sw %s, %d(fp)" src_reg offset ])
+  | Reg s when String.starts_with ~prefix:"t" s ->
+    (* 如果你仍在使用 Reg "tN" 作为 vreg，你需要处理这种情况 *)
+    let v = int_of_string (String.sub s 1 (String.length s - 1)) in
+    (match IntMap.find v alloc_map with
+     | PhysicalReg reg_name ->
+       if src_reg <> reg_name
+       then [ Printf.sprintf "  mv %s, %s" reg_name src_reg ]
+       else []
+     | Spilled offset -> [ Printf.sprintf "  sw %s, %d(fp)" src_reg offset ])
+  (* 情况2 (新增): 目标是物理寄存器 (如 a0, fp, sp) *)
+  | Reg r ->
+    (* 直接移动过去 *)
+    if src_reg <> r then [ Printf.sprintf "  mv %s, %s" r src_reg ] else []
+  (* 其他情况都是非法的 *)
+  | _ -> failwith "Destination of store must be a register (virtual or physical)"
 ;;
 
 (*******************************************************************
