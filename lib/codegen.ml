@@ -1232,3 +1232,5 @@ let compile_source (src : string) : string =
   let ast = Parser.program Lexer.token lexbuf in
   generate_code ast
 ;; *)
+
+(*已废弃*)
