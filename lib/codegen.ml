@@ -573,21 +573,22 @@ let rec gen_expr_ir_internal env (e : expr) : ir list * operand =
         | IR_And | IR_Or ->
           failwith "FATAL: IR_And/IR_Or reached the non-short-circuiting BinOp handler."))
   | Call (fname, args) ->
-    (* 步骤 1: 依次求值并立即溢出每个参数的结果到调用者的栈帧上 (fp-relative) *)
-    let eval_ir, arg_spill_locs_rev =
-      List.fold_left
-        (fun (acc_ir, acc_locs) arg_expr ->
+    (* 步骤 1: 依次求值每个参数，并将结果保存在各自的虚拟寄存器中 *)
+    let args_eval_results =
+      List.map
+        (fun arg_expr ->
            env.temp_counter := 0;
-           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
-           let spill_slot = fresh_vreg env in
-           let spill_ir = [ Store (arg_op, spill_slot) ] in
-           acc_ir @ arg_ir @ spill_ir, spill_slot :: acc_locs)
-        ([], [])
+           (* 为每个参数的计算重置临时vreg计数器 *)
+           gen_expr_ir_internal env arg_expr)
         args
     in
-    let arg_locs = List.rev arg_spill_locs_rev in
+    (* 分离出所有参数的IR和它们最终所在的虚拟寄存器(op) *)
+    let eval_ir_list = List.map fst args_eval_results in
+    let arg_ops = List.map snd args_eval_results in
+    (* 将所有参数求值的IR拼接在一起 *)
+    let eval_ir = List.concat eval_ir_list in
     (* 步骤 2: 区分需要通过寄存器和栈传递的参数 *)
-    let reg_arg_locs, stack_arg_locs =
+    let reg_arg_ops, stack_arg_ops =
       let rec split n lst =
         if n <= 0
         then [], lst
@@ -598,38 +599,34 @@ let rec gen_expr_ir_internal env (e : expr) : ir list * operand =
             let taken, rest = split (n - 1) t in
             h :: taken, rest)
       in
-      split 8 arg_locs
+      split 8 arg_ops (* 前8个用寄存器，其余用栈 *)
     in
-    let num_stack_args = List.length stack_arg_locs in
+    (* 步骤 3: 按照ABI顺序生成参数传递的IR *)
+    (* 3.1: (PreCall) 为需要通过栈传递的参数预留空间 *)
+    let num_stack_args = List.length stack_arg_ops in
     let stack_space_for_args = num_stack_args * 4 in
-    (* 步骤 3: 按照 ABI 顺序生成 IR *)
-    (* 3.1: (PreCall) 先为出参分配栈空间 *)
     let pre_call_ir = [ PreCall stack_space_for_args ] in
-    (* 3.2: (Store) 将需要通过栈传递的参数，从其临时位置加载并存入刚分配的出参栈空间 (sp-relative) *)
+    (* 3.2: (StoreOutArg) 生成将vreg存入出参栈空间的指令 *)
     let stack_passing_ir =
-      List.concat
-        (List.mapi
-           (fun i loc ->
-              (* 使用 t6 作为中转寄存器 *)
-              [ Load (Reg "t6", loc); StoreOutArg (Reg "t6", i * 4) ]
-              (* MODIFIED: Use new IR node *))
-           stack_arg_locs)
+      List.mapi (fun i op -> StoreOutArg (op, i * 4)) stack_arg_ops
     in
-    (* 3.3: (Load) 将需要通过寄存器传递的参数，从其临时位置加载到 a0-a7 *)
+    (* 3.3: (Move) 生成将vreg移动到a0-a7物理寄存器的指令 *)
     let reg_passing_ir =
-      List.mapi (fun i loc -> Load (Reg ("a" ^ string_of_int i), loc)) reg_arg_locs
+      List.mapi (fun i op -> Move (Reg ("a" ^ string_of_int i), op)) reg_arg_ops
     in
-    (* 3.4: (Call) 生成真正的调用指令，以及后续清理和返回值处理 *)
-    let temp_ret_op = fresh_vreg env in
+    (* 步骤 4: 生成真正的调用指令，以及后续清理和返回值处理 *)
+    let return_vreg = fresh_vreg env in
     let call_cleanup_ir =
-      [ Call fname; PostCall stack_space_for_args; Move (temp_ret_op, Reg "a0") ]
+      [ Call fname
+      ; PostCall stack_space_for_args
+      ; Move (return_vreg, Reg "a0") (* 将返回值从a0移入一个新的vreg *)
+      ]
     in
-    (* 最终的 IR 顺序:
-         求值 -> 准备调用栈 -> 传递栈参数 -> 传递寄存器参数 -> 调用和清理 *)
+    (* 最终的 IR 顺序: 求值 -> 准备调用栈 -> 传递栈参数 -> 传递寄存器参数 -> 调用和清理 *)
     let full_ir =
       eval_ir @ pre_call_ir @ stack_passing_ir @ reg_passing_ir @ call_cleanup_ir
     in
-    full_ir, temp_ret_op
+    full_ir, return_vreg
 ;;
 
 (* _ -> failwith "Unsupported expression type in codegen" *)
