@@ -440,7 +440,10 @@ let gen_func_ir_internal (ana : analysis_result) (f : func_def) : ir list =
   @ [ Epilogue (f.fname, stack_size) ]
 ;;
 
-let ir_to_asm_list_internal (ir_instr : ir) : string list =
+(* 新增寄存器缓存：记录某个操作数 -> 对应硬件寄存器 *)
+let reg_cache : (operand, string) Hashtbl.t = Hashtbl.create 16
+
+(* let ir_to_asm_list_internal (ir_instr : ir) : string list =
   let is_small_imm i = i >= -2048 && i <= 2047 in
   let emit_mem_access op_str reg_name offset base_reg =
     if is_small_imm offset
@@ -616,6 +619,195 @@ let ir_to_asm_list_internal (ir_instr : ir) : string list =
       else [ Printf.sprintf "  li t6, %d" stack_size; Printf.sprintf "  add sp, sp, t6" ]
     in
     [ ".L_ret_" ^ fname ^ ":" ] @ restore_fp @ restore_ra @ teardown_sp @ [ "  ret" ]
+;; *)
+(* 替换: ir_to_asm_list_internal *)
+let ir_to_asm_list_internal (stack_cache : (int, string) Hashtbl.t) (ir_instr : ir)
+  : string list
+  =
+  let is_small_imm i = i >= -2048 && i <= 2047 in
+  let emit_mem_access op_str reg_name offset base_reg =
+    if is_small_imm offset
+    then [ Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg ]
+    else
+      [ Printf.sprintf "  li t6, %d" offset
+      ; Printf.sprintf "  add t6, %s, t6" base_reg
+      ; Printf.sprintf "  %s %s, 0(t6)" op_str reg_name
+      ]
+  in
+  let store_from_reg src_reg dest_op =
+    match dest_op with
+    | Reg s -> if s = src_reg then [] else [ Printf.sprintf "  mv %s, %s" s src_reg ]
+    | Stack i -> emit_mem_access "sw" src_reg i "fp"
+    | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
+  in
+  (* cache-aware loader: 优先查 stack_cache *)
+  let load_operand_to_temp_with_cache op =
+    match op with
+    | Reg s -> [], s
+    | Stack i ->
+      let cached =
+        try Some (Hashtbl.find stack_cache i) with
+        | Not_found -> None
+      in
+      (match cached with
+       | Some reg -> [], reg
+       | None ->
+         let temp_reg =
+           match get_stack_temp_reg () with
+           | Reg s -> s
+           | _ -> failwith "impossible"
+         in
+         let load_ir = emit_mem_access "lw" temp_reg i "fp" in
+         Hashtbl.add stack_cache i temp_reg;
+         load_ir, temp_reg)
+    | Imm i ->
+      let temp_reg =
+        match get_stack_temp_reg () with
+        | Reg s -> s
+        | _ -> failwith "impossible"
+      in
+      [ Printf.sprintf "  li %s, %d" temp_reg i ], temp_reg
+  in
+  let ensure_in_reg op target_reg =
+    match op with
+    | Reg s ->
+      if s = target_reg
+      then [], s
+      else [ Printf.sprintf "  mv %s, %s" target_reg s ], target_reg
+    | Stack i -> emit_mem_access "lw" target_reg i "fp", target_reg
+    | Imm i -> [ Printf.sprintf "  li %s, %d" target_reg i ], target_reg
+  in
+  match ir_instr with
+  | Label s -> [ s ^ ":" ]
+  | Li (dest, imm) ->
+    let load_imm_ir = [ Printf.sprintf "  li t6, %d" imm ] in
+    let store_ir = store_from_reg "t6" dest in
+    load_imm_ir @ store_ir
+  | Move (dest, src) ->
+    let load_ir, src_reg_name =
+      match src with
+      | Reg s -> [], s
+      | Stack i ->
+        (* For move-from-stack we do a direct lw into t6 then store into dest *)
+        emit_mem_access "lw" "t6" i "fp", "t6"
+      | Imm v -> [ Printf.sprintf "  li t6, %d" v ], "t6"
+    in
+    let store_ir = store_from_reg src_reg_name dest in
+    load_ir @ store_ir
+  | Load (dest, src) ->
+    (match src with
+     | Stack i ->
+       let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
+       let store_dest_ir = store_from_reg "t6" dest in
+       load_val_ir @ store_dest_ir
+     | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location")
+  | Store (src, dest) ->
+    (match dest with
+     | Stack i ->
+       (* 存内存之前 invalidate cache（保守策略） *)
+       (try Hashtbl.remove stack_cache i with
+        | _ -> ());
+       let load_src_ir, src_reg = ensure_in_reg src "t6" in
+       let store_ir = emit_mem_access "sw" src_reg i "fp" in
+       load_src_ir @ store_ir
+     | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location")
+  | StoreOutArg (src, offset) ->
+    let load_src_ir, src_reg = ensure_in_reg src "t6" in
+    let store_ir = emit_mem_access "sw" src_reg offset "sp" in
+    load_src_ir @ store_ir
+  | UnOp (op, dest, src) ->
+    let op_str =
+      match op with
+      | IR_Neg -> "neg"
+      | IR_Not -> "seqz"
+    in
+    let load_ir, src_reg = ensure_in_reg src "t6" in
+    let compute_ir = [ Printf.sprintf "  %s t6, %s" op_str src_reg ] in
+    let store_ir = store_from_reg "t6" dest in
+    load_ir @ compute_ir @ store_ir
+  | BinOp (op, dest, src1, src2) ->
+    stack_temp_counter := 0;
+    let op_str =
+      match op with
+      | IR_Add -> "add"
+      | IR_Sub -> "sub"
+      | IR_Mul -> "mul"
+      | IR_Div -> "div"
+      | IR_Mod -> "rem"
+      | _ -> failwith "Invalid op for BinOp"
+    in
+    let load1_ir, r1 = load_operand_to_temp_with_cache src1 in
+    let load2_ir, r2 = load_operand_to_temp_with_cache src2 in
+    let result_reg =
+      match get_stack_temp_reg () with
+      | Reg s -> s
+      | _ -> failwith "impossible"
+    in
+    let compute_ir = [ Printf.sprintf "  %s %s, %s, %s" op_str result_reg r1 r2 ] in
+    let store_ir = store_from_reg result_reg dest in
+    load1_ir @ load2_ir @ compute_ir @ store_ir
+  | BranchZ (src, label) ->
+    let load_ir, reg = ensure_in_reg src "t6" in
+    load_ir @ [ Printf.sprintf "  beqz %s, %s" reg label ]
+  | BranchNZ (src, label) ->
+    let load_ir, reg = ensure_in_reg src "t6" in
+    load_ir @ [ Printf.sprintf "  bnez %s, %s" reg label ]
+  | Branch (op, src1, src2, label) ->
+    stack_temp_counter := 0;
+    let branch_op_str =
+      match op with
+      | IR_Eq -> "beq"
+      | IR_Neq -> "bne"
+      | IR_Lt -> "blt"
+      | IR_Le -> "ble"
+      | IR_Gt -> "bgt"
+      | IR_Ge -> "bge"
+      | _ -> failwith "Invalid op for Branch"
+    in
+    let load1_ir, r1 = load_operand_to_temp_with_cache src1 in
+    let load2_ir, r2 = load_operand_to_temp_with_cache src2 in
+    let branch_ir = [ Printf.sprintf "  %s %s, %s, %s" branch_op_str r1 r2 label ] in
+    load1_ir @ load2_ir @ branch_ir
+  | Jump s -> [ Printf.sprintf "  j %s" s ]
+  | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
+  | PreCall stack_space ->
+    if stack_space > 0
+    then
+      if is_small_imm (-stack_space)
+      then [ Printf.sprintf "  addi sp, sp, -%d" stack_space ]
+      else [ Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  sub sp, sp, t6" ]
+    else []
+  | Call s -> [ Printf.sprintf "  call %s" s ]
+  | PostCall stack_space ->
+    if stack_space > 0
+    then
+      if is_small_imm stack_space
+      then [ Printf.sprintf "  addi sp, sp, %d" stack_space ]
+      else [ Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  add sp, sp, t6" ]
+    else []
+  | Prologue (fname, stack_size) ->
+    let setup_sp =
+      if is_small_imm (-stack_size)
+      then [ Printf.sprintf "  addi sp, sp, -%d" stack_size ]
+      else [ Printf.sprintf "  li t6, %d" stack_size; Printf.sprintf "  sub sp, sp, t6" ]
+    in
+    let save_ra = emit_mem_access "sw" "ra" (stack_size - 4) "sp" in
+    let save_fp = emit_mem_access "sw" "fp" (stack_size - 8) "sp" in
+    let setup_fp =
+      if is_small_imm stack_size
+      then [ Printf.sprintf "  addi fp, sp, %d" stack_size ]
+      else [ Printf.sprintf "   li t6, %d" stack_size; Printf.sprintf "  add fp, sp, t6" ]
+    in
+    [ ".text"; ".globl " ^ fname; fname ^ ":" ] @ setup_sp @ save_ra @ save_fp @ setup_fp
+  | Epilogue (fname, stack_size) ->
+    let restore_fp = emit_mem_access "lw" "fp" (stack_size - 8) "sp" in
+    let restore_ra = emit_mem_access "lw" "ra" (stack_size - 4) "sp" in
+    let teardown_sp =
+      if is_small_imm stack_size
+      then [ Printf.sprintf "  addi sp, sp, %d" stack_size ]
+      else [ Printf.sprintf "  li t6, %d" stack_size; Printf.sprintf "  add sp, sp, t6" ]
+    in
+    [ ".L_ret_" ^ fname ^ ":" ] @ restore_fp @ restore_ra @ teardown_sp @ [ "  ret" ]
 ;;
 
 (*******************************************************************
@@ -689,7 +881,7 @@ let gen_program (p : program) : ir list =
   List.concat_map (gen_func_ir_internal ana) p
 ;;
 
-let gen_assembly (ir_code : ir list) : string list =
+(* let gen_assembly (ir_code : ir list) : string list =
   let current_fname = ref "" in
   let convert_ir_to_asm ir =
     (match ir with
@@ -701,6 +893,63 @@ let gen_assembly (ir_code : ir list) : string list =
     else ir_to_asm_list_internal ir
   in
   List.concat_map convert_ir_to_asm ir_code
+;; *)
+let peephole_optimize (lines : string list) : string list =
+  let words_of s =
+    let s = String.map (fun c -> if c = ',' then ' ' else c) (String.trim s) in
+    let parts = String.split_on_char ' ' s in
+    List.filter (fun x -> x <> "") parts
+  in
+  let rec loop acc rest =
+    match rest with
+    | a :: b :: t ->
+      let wa = words_of a in
+      let wb = words_of b in
+      (* 删除 mv r, r *)
+      (match wa with
+       | [ "mv"; r1; r2 ] when r1 = r2 -> loop acc (b :: t)
+       | _ ->
+         (* 合并连续 addi 同一寄存器 *)
+         (match wa, wb with
+          | [ "addi"; r1; _; imm1 ], [ "addi"; r2; _; imm2 ] when r1 = r2 ->
+            (try
+               let v1 = int_of_string imm1 in
+               let v2 = int_of_string imm2 in
+               let combined = Printf.sprintf "  addi %s, %s, %d" r1 r1 (v1 + v2) in
+               loop acc (combined :: t)
+             with
+             | _ -> loop (a :: acc) (b :: t))
+          | _ -> loop (a :: acc) (b :: t)))
+    | [ x ] -> List.rev (x :: acc)
+    | [] -> List.rev acc
+  in
+  loop [] lines
+;;
+
+let gen_assembly (ir_code : ir list) : string list =
+  let current_fname = ref "" in
+  let asm_acc = ref [] in
+  (* per-function cache: fp-offset(int) -> temp-reg string *)
+  let stack_cache : (int, string) Hashtbl.t = Hashtbl.create 256 in
+  List.iter
+    (fun ir ->
+       (match ir with
+        | Prologue (fname, _) ->
+          current_fname := fname;
+          (* 每个函数重置 cache 及 t4/t5/t6 轮换计数器 *)
+          Hashtbl.clear stack_cache;
+          stack_temp_counter := 0
+        | Epilogue (_, _) -> ()
+        | _ -> ());
+       let asm_lines =
+         if ir = Ret
+         then [ Printf.sprintf "  j .L_ret_%s" !current_fname ]
+         else ir_to_asm_list_internal stack_cache ir
+       in
+       asm_acc := !asm_acc @ asm_lines)
+    ir_code;
+  (* 最后做一遍轻量 peephole 优化 *)
+  peephole_optimize !asm_acc
 ;;
 
 let generate_code (p : program) : string =
