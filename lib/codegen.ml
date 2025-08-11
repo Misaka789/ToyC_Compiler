@@ -1102,8 +1102,18 @@ let ir_to_asm_list_final
     ; "  ret"
     ]
   (* 如果有未处理的指令，明确地报错 *)
-  | Store (_, _) ->
-    failwith "Store instruction is not handled yet in final asm generation"
+  | Store (src, dest) ->
+    (match dest with
+     | Stack fp_offset ->
+       (* 这是最常见的情况：将一个值存入一个本地变量的栈槽 *)
+       (* 步骤: load src 到 t5 -> sw t5, fp_offset(fp) *)
+       let load_src = ensure_in_reg src temp_reg1 alloc_map stack_layout in
+       let store_instr = [ Printf.sprintf "  sw %s, %d(fp)" temp_reg1 fp_offset ] in
+       load_src @ store_instr
+     | _ ->
+       (* Store 的目标也可能是另一个寄存器里的地址，这需要更复杂的处理。
+             但根据你目前的IR生成逻辑，目标应该总是 Stack offset。*)
+       failwith "Unsupported destination for Store instruction in final asm generation")
 ;;
 
 let gen_assembly_for_function (f : func_def) (ana : analysis_result) : string list =
