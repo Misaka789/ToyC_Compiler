@@ -371,174 +371,28 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
   [Prologue (f.fname, stack_size)] @ params_save_ir @ body_ir @ [Epilogue (f.fname, stack_size)]
 
 
-(*******************************************************************
- * 3. 从 IR 到 RISC-V 汇编的转换 (内部函数)
- *******************************************************************)
-
-(* In Section 3 - FINAL, CORRECTED VERSION of ir_to_asm_list_internal *)
-
-(* let ir_to_asm_list_internal (ir_instr: ir) : string list =
-  let is_small_imm i = i >= -2048 && i <= 2047 in
-  let emit_mem_access op_str reg_name offset base_reg =
-    if is_small_imm offset then
-      [Printf.sprintf "  %s %s, %d(%s)" op_str reg_name offset base_reg]
-    else
-      [Printf.sprintf "  li t6, %d" offset;
-       Printf.sprintf "  add t6, %s, t6" base_reg;
-       Printf.sprintf "  %s %s, 0(t6)" op_str reg_name]
+(*
+ * 这是一个简单的优化函数占位符。
+ * 它可以执行例如 "窥孔优化" (peephole optimization) 来消除冗余指令。
+ *
+ * 示例：消除冗余的 `Move` 指令，例如 `mv t0, t0`。
+ *
+ * @param ir_code 未优化的IR指令列表
+ * @return 优化后的IR指令列表
+ *)
+let optimize_ir (ir_code: ir list) : ir list =
+  let rec process_list ir_list =
+    match ir_list with
+    | [] -> []
+    | (Move (Reg dest, Reg src)) :: rest when dest = src ->
+        (* 找到 'move reg, reg' 这种冗余指令，直接丢弃它 *)
+        process_list rest
+    | instr :: rest ->
+        (* 保留其它所有指令 *)
+        instr :: process_list rest
   in
-  let ensure_in_reg op target_reg =
-    match op with
-    | Reg s ->
-        if s = target_reg then [], s else [Printf.sprintf "  mv %s, %s" target_reg s], target_reg
-    | Stack i ->
-        emit_mem_access "lw" target_reg i "fp", target_reg
-    | Imm i ->
-        [Printf.sprintf "  li %s, %d" target_reg i], target_reg
-  in
-  let store_from_reg src_reg dest_op =
-    match dest_op with
-    | Reg s ->
-        if s = src_reg then [] else [Printf.sprintf "  mv %s, %s" s src_reg]
-    | Stack i ->
-        emit_mem_access "sw" src_reg i "fp"
-    | Imm _ -> failwith "FATAL: Cannot store into an immediate value"
-  in
+  process_list ir_code
 
-  match ir_instr with
-  | Label s -> [s ^ ":"]
-  | Li (dest, imm) ->
-      let load_imm_ir = [Printf.sprintf "  li t6, %d" imm] in
-      let store_ir = store_from_reg "t6" dest in
-      load_imm_ir @ store_ir
-  | Move (dest, src) ->
-      let load_ir, src_reg_name = ensure_in_reg src "t6" in
-      let store_ir = store_from_reg src_reg_name dest in
-      load_ir @ store_ir
-  | Load (dest, src) ->
-      (* RESTORED: Load is only for fp-relative access *)
-      (match src with
-      | Stack i ->
-          let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
-          let store_dest_ir = store_from_reg "t6" dest in
-          load_val_ir @ store_dest_ir
-      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location")
-  | Store (src, dest) ->
-      (match dest with
-      | Stack i ->
-          let load_src_ir, src_reg = ensure_in_reg src "t6" in
-          let store_ir = emit_mem_access "sw" src_reg i "fp" in
-          load_src_ir @ store_ir
-      | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location")
-  | StoreOutArg (src, offset) ->
-      let load_src_ir, src_reg = ensure_in_reg src "t6" in
-      let store_ir = emit_mem_access "sw" src_reg offset "sp" in
-      load_src_ir @ store_ir
-  | UnOp (op, dest, src) ->
-      let op_str = match op with IR_Neg -> "neg" | IR_Not -> "seqz" in
-      let load_ir, src_reg = ensure_in_reg src "t6" in
-      let compute_ir = [Printf.sprintf "  %s t6, %s" op_str src_reg] in
-      let store_ir = store_from_reg "t6" dest in
-      load_ir @ compute_ir @ store_ir
-      
-  (*** NEW, ROBUST BinOp ASSEMBLY LOGIC ***)
-  | BinOp (op, dest, src1, src2) ->
-      let op_str = match op with | IR_Add -> "add" | IR_Sub -> "sub" | IR_Mul -> "mul" | IR_Div -> "div" | IR_Mod -> "rem" | _ -> failwith "Invalid op for BinOp" in
-      
-      (* Step 1: Safely load src1 and src2 into t5 and t6, avoiding clobbering. *)
-      let load_ir, r1, r2 =
-        match src1, src2 with
-        (* If both are already registers, just use them. *)
-        | Reg r1, Reg r2 -> [], r1, r2
-        (* If one is a register and the other is not, load the non-reg one. *)
-        | Reg r1, other ->
-            let load2_ir, r2 = ensure_in_reg other "t6" in
-            load2_ir, r1, r2
-        | other, Reg r2 ->
-            let load1_ir, r1 = ensure_in_reg other "t5" in
-            load1_ir, r1, r2
-        (* If neither are registers, load both. *)
-        | other1, other2 ->
-            let load1_ir, r1 = ensure_in_reg other1 "t5" in
-            let load2_ir, r2 = ensure_in_reg other2 "t6" in
-            load1_ir @ load2_ir, r1, r2
-      in
-      
-      (* Step 2: Perform the computation, placing result in t5. *)
-      let compute_ir = [Printf.sprintf "  %s t5, %s, %s" op_str r1 r2] in
-      
-      (* Step 3: Store the result from t5 to the final destination. *)
-      let store_ir = store_from_reg "t5" dest in
-      
-      load_ir @ compute_ir @ store_ir
-  | BranchZ (src, label) ->
-      let load_ir, reg = ensure_in_reg src "t6" in
-      load_ir @ [Printf.sprintf "  beqz %s, %s" reg label]
-  | BranchNZ (src, label) ->
-      let load_ir, reg = ensure_in_reg src "t6" in
-      load_ir @ [Printf.sprintf "  bnez %s, %s" reg label]    
-      
-      
-  | Branch (op, src1, src2, label) ->
-      (* This logic can also be made safer, similar to BinOp *)
-      let branch_op_str = match op with | IR_Eq -> "beq" | IR_Neq -> "bne" | IR_Lt -> "blt" | IR_Le -> "ble" | IR_Gt -> "bgt" | IR_Ge -> "bge" | _ -> failwith "Invalid op for Branch" in
-      let load_ir, r1, r2 =
-        match src1, src2 with
-        | Reg r1, Reg r2 -> [], r1, r2
-        | Reg r1, other -> let load2_ir, r2 = ensure_in_reg other "t6" in load2_ir, r1, r2
-        | other, Reg r2 -> let load1_ir, r1 = ensure_in_reg other "t5" in load1_ir, r1, r2
-        | other1, other2 ->
-            let load1_ir, r1 = ensure_in_reg other1 "t5" in
-            let load2_ir, r2 = ensure_in_reg other2 "t6" in
-            load1_ir @ load2_ir, r1, r2
-      in
-      let branch_ir = [Printf.sprintf "  %s %s, %s, %s" branch_op_str r1 r2 label] in
-      load_ir @ branch_ir
-
-  (* ... All other cases from PreCall to Epilogue remain the same as the last version ... *)
-  | Jump s -> [Printf.sprintf "  j %s" s]
-  | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
-  | PreCall (stack_space) ->
-      if stack_space > 0 then
-        (if is_small_imm (-stack_space) then [Printf.sprintf "  addi sp, sp, -%d" stack_space]
-         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  sub sp, sp, t6"])
-      else []
-  | Call s ->
-      [Printf.sprintf "  call %s" s]
-  | PostCall (stack_space) ->
-      if stack_space > 0 then
-        (if is_small_imm stack_space then [Printf.sprintf "  addi sp, sp, %d" stack_space]
-         else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  add sp, sp, t6"])
-      else []
-  | Prologue (fname, stack_size) ->
-      let setup_sp =
-        if is_small_imm (-stack_size) then
-          [Printf.sprintf "  addi sp, sp, -%d" stack_size]
-        else
-          [Printf.sprintf "  li t6, %d" stack_size;
-           Printf.sprintf "  sub sp, sp, t6"]
-      in
-      let save_ra = emit_mem_access "sw" "ra" (stack_size - 4) "sp" in
-      let save_fp = emit_mem_access "sw" "fp" (stack_size - 8) "sp" in
-      let setup_fp =
-        if is_small_imm stack_size then
-          [Printf.sprintf "  addi fp, sp, %d" stack_size]
-        else
-          [Printf.sprintf "  li t6, %d" stack_size;
-           Printf.sprintf "  add fp, sp, t6"]
-      in
-      [".text"; ".globl " ^ fname; fname ^ ":"] @ setup_sp @ save_ra @ save_fp @ setup_fp
-  | Epilogue (fname, stack_size) ->
-      let restore_fp = emit_mem_access "lw" "fp" (stack_size - 8) "sp" in
-      let restore_ra = emit_mem_access "lw" "ra" (stack_size - 4) "sp" in
-      let teardown_sp =
-        if is_small_imm stack_size then
-          [Printf.sprintf "  addi sp, sp, %d" stack_size]
-        else
-          [Printf.sprintf "  li t6, %d" stack_size;
-           Printf.sprintf "  add sp, sp, t6"]
-      in
-      [".L_ret_" ^ fname ^ ":"] @ restore_fp @ restore_ra @ teardown_sp @ ["  ret"] *)
 
   let ir_to_asm_list_internal (ir_instr: ir) : string list =
   let is_small_imm i = i >= -2048 && i <= 2047 in
@@ -761,8 +615,12 @@ if ir = Ret then [Printf.sprintf "  j .L_ret_%s" !current_fname]
   List.concat_map convert_ir_to_asm ir_code
 
 let generate_code (p: program) : string =
+  (* 1. AST -> IR *)
   let ir = gen_program p in
-  let asm_lines = gen_assembly ir in
+  (* 2. IR -> Optimized IR *)
+  let optimized_ir = optimize_ir ir in
+  (* 3. Optimized IR -> Assembly *)
+  let asm_lines = gen_assembly optimized_ir in
   String.concat "\n" asm_lines
 
 let compile_source (src: string) : string =
