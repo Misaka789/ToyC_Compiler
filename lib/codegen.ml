@@ -393,13 +393,9 @@ end)
  *)
 let optimize_ir (ir_code: ir list) : ir list =
   (*
-   * `propagate_constants_pass`: 执行单次常量传播和折叠。
-   * `consts`: 从操作数到其常量值的映射。
-   * `ir_list`: 当前的IR指令列表。
-   * 返回一个元组: (优化后的新IR列表, 新的常量映射, 是否发生了变化)
+   * Pass 1: 常量传播与分支简化
    *)
   let propagate_constants_pass (consts: int OperandMap.t) (ir_list: ir list) =
-    (* `lookup_op`: 辅助函数，检查一个操作数是否为已知常量 *)
     let lookup_op op const_map =
       match op with
       | Imm n -> Some n
@@ -409,27 +405,22 @@ let optimize_ir (ir_code: ir list) : ir list =
     List.fold_left (fun (acc_ir, current_consts, changed) instr ->
       let new_instr, new_consts, made_change =
         match instr with
-        (* 基础传播：加载立即数 *)
         | Li (dest, n) ->
             ([Li (dest, n)], OperandMap.add dest n current_consts, true)
 
-        (* 基础传播：移动 *)
         | Move (dest, src) ->
             (match lookup_op src current_consts with
             | Some n ->
-                (* 从一个常量源移动 -> 传播常量, 并将 Move 替换为 Li *)
                 ([Li (dest, n)], OperandMap.add dest n current_consts, true)
             | None ->
-                (* 源不是常量 -> 目标也不再是常量 *)
                 ([Move (dest, src)], OperandMap.remove dest current_consts, false))
 
-        (* 核心优化：常量折叠 *)
         | BinOp (op, dest, src1, src2) ->
             (match (lookup_op src1 current_consts, lookup_op src2 current_consts) with
             | (Some n1, Some n2) ->
                 let result = match op with
                   | IR_Add -> n1 + n2  | IR_Sub -> n1 - n2
-                  | IR_Mul -> n1 * n2  | IR_Div -> if n2 = 0 then 0 else n1 / n2 (* Avoid division by zero *)
+                  | IR_Mul -> n1 * n2  | IR_Div -> if n2 = 0 then 0 else n1 / n2
                   | IR_Mod -> if n2 = 0 then 0 else n1 mod n2
                   | IR_Eq  -> if n1 = n2 then 1 else 0 | IR_Neq -> if n1 <> n2 then 1 else 0
                   | IR_Lt  -> if n1 < n2 then 1 else 0 | IR_Le  -> if n1 <= n2 then 1 else 0
@@ -437,33 +428,71 @@ let optimize_ir (ir_code: ir list) : ir list =
                   | IR_And -> if n1<>0 && n2<>0 then 1 else 0
                   | IR_Or  -> if n1<>0 || n2<>0 then 1 else 0
                 in
-                (* 用一条 Li 指令替换掉整个 BinOp *)
                 ([Li (dest, result)], OperandMap.add dest result current_consts, true)
             | _ ->
-                (* 操作数不全是常量 -> 无法折叠, 目标值变为未知 *)
                 ([instr], OperandMap.remove dest current_consts, false))
+        
+        (* 【新增】分支简化 *)
+        | BranchZ (op, label) ->
+            (match lookup_op op current_consts with
+            | Some 0 -> ([Jump label], current_consts, true) (* 条件为真，必跳 *)
+            | Some _ -> ([], current_consts, true) (* 条件为假，删除分支 *)
+            | None -> ([instr], current_consts, false))
+        | BranchNZ (op, label) ->
+            (match lookup_op op current_consts with
+            | Some 0 -> ([], current_consts, true) (* 条件为假，删除分支 *)
+            | Some _ -> ([Jump label], current_consts, true) (* 条件为真，必跳 *)
+            | None -> ([instr], current_consts, false))
 
-        (* 对于修改目标的操作数，必须使其常量状态失效 *)
         | UnOp (_, dest, _) | Load (dest, _) ->
             ([instr], OperandMap.remove dest current_consts, false)
         | Call _ ->
-             (* 函数调用会修改 a0(返回值) 和可能的 other caller-saved registers, 这里简单处理 a0 *)
             ([instr], OperandMap.remove (Reg "a0") current_consts, false)
 
-        (* 其他指令不影响常量传播，直接保留 *)
         | _ -> ([instr], current_consts, false)
       in
       (acc_ir @ new_instr, new_consts, changed || made_change)
     ) ([], consts, false) ir_list
   in
 
+  (*
+   * Pass 2: 不可达代码消除
+   *)
+  let eliminate_unreachable_code_pass (ir_list: ir list) =
+    let rec process_list current_ir reachable acc =
+      match current_ir with
+      | [] -> (List.rev acc, false) (* 遍历完成，返回结果 *)
+      | instr :: rest ->
+          match instr with
+          | Label _ ->
+              (* 标签总是可达的，重置状态并保留标签 *)
+              process_list rest true (instr :: acc)
+          | _ ->
+              if reachable then
+                let new_reachable = match instr with
+                  | Jump _ | Ret -> false (* 这个指令之后是不可达代码 *)
+                  | _ -> true
+                in
+                process_list rest new_reachable (instr :: acc)
+              else
+                (* 代码不可达，丢弃指令 *)
+                process_list rest false acc
+    in
+    let (final_ir, _) = process_list ir_list true [] in
+    (final_ir, List.length final_ir <> List.length ir_list)
+  in
+
   (* 迭代循环，直到没有优化发生 *)
   let rec fixed_point_loop current_ir =
-    let (next_ir, _, changed) = propagate_constants_pass OperandMap.empty current_ir in
-    if changed then
-      fixed_point_loop next_ir
+    (* Pass 1: 常量传播和分支简化 *)
+    let (ir_after_const_prop, _, changed1) = propagate_constants_pass OperandMap.empty current_ir in
+    (* Pass 2: 不可达代码消除 *)
+    let (ir_after_dce, changed2) = eliminate_unreachable_code_pass ir_after_const_prop in
+
+    if changed1 || changed2 then
+      fixed_point_loop ir_after_dce
     else
-      current_ir (* 达到不动点，返回最终结果 *)
+      ir_after_dce (* 达到不动点，返回最终结果 *)
   in
 
   fixed_point_loop ir_code
