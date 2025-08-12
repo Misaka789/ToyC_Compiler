@@ -1,4 +1,3 @@
-
 (* lib/codegen.ml *)
 open Ast
 open Semantic
@@ -52,9 +51,9 @@ type ir =
 type cg_env = {
   funcs: func_sig FuncEnv.t;
   vars: int VarEnv.t list; (* A stack of scopes，变成list存储不同作用域 *)
-  stack_top: int ref;      
+  stack_top: int ref;
    temp_counter: int ref;        (* MODIFIED *)
-  label_counter: int ref;       (* MODIFIED *)
+  label_counter: int ref; (* MODIFIED *)
   current_function_name: string; (* NEW: Store the current function's name，用于label命名 *)
 }
 
@@ -73,7 +72,7 @@ let find_var_offset (env: cg_env) (name: string) : int =
 (* 在栈上为临时计算结果分配空间 *)
 let alloc_temp_stack_slot env =
   env.stack_top := !(env.stack_top) - 4;
-Stack !(env.stack_top)
+  Stack !(env.stack_top)
 
 (* 创建一个新的临时操作数。优先使用寄存器 (t0-t3)，用尽后在栈上分配空间 *)
 let fresh_temp env = (* Renamed from fresh_temp for clarity *)
@@ -118,7 +117,7 @@ let unop_from_ast_op op =
  * 2. 从 AST 到 IR 的转换 (内部函数)
  *******************************************************************)
 
- 
+
 let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
   match e with
   | IntLiteral n ->
@@ -144,6 +143,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let end_label = fresh_label env "L_end_" in
           let ir1, op1 = gen_expr_ir_internal env e1 in
           env.temp_counter := 0;
+
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchZ(op1, false_label)] @ ir2 @ [BranchZ(op2, false_label)] @
           [Li(dest_op, 1); Jump(end_label); Label(false_label); Li(dest_op, 0); Label(end_label)], dest_op
@@ -156,28 +156,30 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let ir2, op2 = gen_expr_ir_internal env e2 in
           ir1 @ [BranchNZ(op1, true_label)] @ ir2 @ [BranchNZ(op2, true_label)] @
           [Li(dest_op, 0); Jump(end_label); Label(true_label); Li(dest_op, 1); Label(end_label)], dest_op
-      
+
       (* The robust "Spill-and-Reload" strategy, but this time with a correct assembler *)
       | _ ->
           (* This order of evaluation (e1 then e2) is more conventional *)
           let ir1, op1 = gen_expr_ir_internal env e1 in
           let temp_slot_for_op1 = alloc_temp_stack_slot env in
           let save_ir = [Store(op1, temp_slot_for_op1)] in
-          
+
           env.temp_counter := 0; (* Reset temps for the other side *)
-          
+
           let ir2, op2 = gen_expr_ir_internal env e2 in
-          
+
           let loaded_op1 = fresh_temp env in
           let load_ir = [Load(loaded_op1, temp_slot_for_op1)] in
-          
+
           let dest_op = fresh_temp env in
+
           let final_op = binop_from_ast_op op in
-          
+
           let full_ir = ir1 @ save_ir @ ir2 @ load_ir in
-          
+
           (match final_op with
           | IR_Eq | IR_Neq | IR_Lt | IR_Le | IR_Gt | IR_Ge ->
+
               let true_label = fresh_label env "L_true_" in
               let end_label = fresh_label env "L_end_" in
               full_ir @
@@ -199,6 +201,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
           let arg_ir, arg_op = gen_expr_ir_internal env arg_expr in
           let spill_slot = alloc_temp_stack_slot env in
           let spill_ir = [Store (arg_op, spill_slot)] in
+
           (acc_ir @ arg_ir @ spill_ir, spill_slot :: acc_locs)
         ) ([], []) args
       in
@@ -219,6 +222,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
       in
       let num_stack_args = List.length stack_arg_locs in
       let stack_space_for_args = num_stack_args * 4 in
+
 
       (* 步骤 3: 按照 ABI 顺序生成 IR *)
       (* 3.1: (PreCall) 先为出参分配栈空间 *)
@@ -254,7 +258,7 @@ let rec gen_expr_ir_internal env (e: expr) : ir list * operand =
          求值 -> 准备调用栈 -> 传递栈参数 -> 传递寄存器参数 -> 调用和清理 *)
       let full_ir = eval_ir @ pre_call_ir @ stack_passing_ir @ reg_passing_ir @ call_cleanup_ir in
       (full_ir, temp_ret_op)
-  
+
 (* _ -> failwith "Unsupported expression type in codegen" *)
 
 
@@ -304,7 +308,8 @@ let rec gen_stmt_ir_internal (env: cg_env) ?break_lbl ?cont_lbl (s: stmt) : ir l
       let end_label = fresh_label env "L_end_" in
       let (then_ir, _) = gen_stmt_ir_internal env ?break_lbl ?cont_lbl then_s in
       (match else_s_opt with
-      | None ->
+
+       | None ->
           (cond_ir @ [BranchZ (cond_op, end_label)] @ then_ir @ [Label end_label], env)
       | Some else_s ->
           let (else_ir, _) = gen_stmt_ir_internal env ?break_lbl ?cont_lbl else_s in
@@ -348,10 +353,11 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
   (* 2. Create the initial generation environment *)
   let env = {
   funcs = ana.global_funcs;
-    vars = [initial_var_map]; (* Start with one scope for parameters *)
+  vars = [initial_var_map]; (* Start with one scope for parameters *)
     stack_top = ref !param_offset;
-    temp_counter = ref 0;        (* MODIFIED *)
-    label_counter = ref 0;       (* MODIFIED *)
+  temp_counter = ref 0;        (* MODIFIED *)
+    label_counter = ref 0;
+  (* MODIFIED *)
     current_function_name = f.fname; (* INITIALIZE HERE *)
 } in
 
@@ -371,30 +377,102 @@ let gen_func_ir_internal (ana: analysis_result) (f: func_def) : ir list =
   [Prologue (f.fname, stack_size)] @ params_save_ir @ body_ir @ [Epilogue (f.fname, stack_size)]
 
 
+(*******************************************************************
+ * 3. IR 优化 (IR Optimization)
+ *******************************************************************)
+
+(* 为 'operand' 类型创建一个 Map 模块，用于常量传播 *)
+module OperandMap = Map.Make(struct
+  type t = operand
+  let compare = compare
+end)
+
 (*
- * 这是一个简单的优化函数占位符。
- * 它可以执行例如 "窥孔优化" (peephole optimization) 来消除冗余指令。
- *
- * 示例：消除冗余的 `Move` 指令，例如 `mv t0, t0`。
- *
- * @param ir_code 未优化的IR指令列表
- * @return 优化后的IR指令列表
+ * `optimize_ir`: 优化的主入口点。
+ * 它会持续对IR进行优化，直到IR不再发生变化为止（达到不动点）。
  *)
 let optimize_ir (ir_code: ir list) : ir list =
-  let rec process_list ir_list =
-    match ir_list with
-    | [] -> []
-    | (Move (Reg dest, Reg src)) :: rest when dest = src ->
-        (* 找到 'move reg, reg' 这种冗余指令，直接丢弃它 *)
-        process_list rest
-    | instr :: rest ->
-        (* 保留其它所有指令 *)
-        instr :: process_list rest
+  (*
+   * `propagate_constants_pass`: 执行单次常量传播和折叠。
+   * `consts`: 从操作数到其常量值的映射。
+   * `ir_list`: 当前的IR指令列表。
+   * 返回一个元组: (优化后的新IR列表, 新的常量映射, 是否发生了变化)
+   *)
+  let propagate_constants_pass (consts: int OperandMap.t) (ir_list: ir list) =
+    (* `lookup_op`: 辅助函数，检查一个操作数是否为已知常量 *)
+    let lookup_op op const_map =
+      match op with
+      | Imm n -> Some n
+      | Reg _ | Stack _ -> OperandMap.find_opt op const_map
+    in
+
+    List.fold_left (fun (acc_ir, current_consts, changed) instr ->
+      let new_instr, new_consts, made_change =
+        match instr with
+        (* 基础传播：加载立即数 *)
+        | Li (dest, n) ->
+            ([Li (dest, n)], OperandMap.add dest n current_consts, true)
+
+        (* 基础传播：移动 *)
+        | Move (dest, src) ->
+            (match lookup_op src current_consts with
+            | Some n ->
+                (* 从一个常量源移动 -> 传播常量, 并将 Move 替换为 Li *)
+                ([Li (dest, n)], OperandMap.add dest n current_consts, true)
+            | None ->
+                (* 源不是常量 -> 目标也不再是常量 *)
+                ([Move (dest, src)], OperandMap.remove dest current_consts, false))
+
+        (* 核心优化：常量折叠 *)
+        | BinOp (op, dest, src1, src2) ->
+            (match (lookup_op src1 current_consts, lookup_op src2 current_consts) with
+            | (Some n1, Some n2) ->
+                let result = match op with
+                  | IR_Add -> n1 + n2  | IR_Sub -> n1 - n2
+                  | IR_Mul -> n1 * n2  | IR_Div -> if n2 = 0 then 0 else n1 / n2 (* Avoid division by zero *)
+                  | IR_Mod -> if n2 = 0 then 0 else n1 mod n2
+                  | IR_Eq  -> if n1 = n2 then 1 else 0 | IR_Neq -> if n1 <> n2 then 1 else 0
+                  | IR_Lt  -> if n1 < n2 then 1 else 0 | IR_Le  -> if n1 <= n2 then 1 else 0
+                  | IR_Gt  -> if n1 > n2 then 1 else 0 | IR_Ge  -> if n1 >= n2 then 1 else 0
+                  | IR_And -> if n1<>0 && n2<>0 then 1 else 0
+                  | IR_Or  -> if n1<>0 || n2<>0 then 1 else 0
+                in
+                (* 用一条 Li 指令替换掉整个 BinOp *)
+                ([Li (dest, result)], OperandMap.add dest result current_consts, true)
+            | _ ->
+                (* 操作数不全是常量 -> 无法折叠, 目标值变为未知 *)
+                ([instr], OperandMap.remove dest current_consts, false))
+
+        (* 对于修改目标的操作数，必须使其常量状态失效 *)
+        | UnOp (_, dest, _) | Load (dest, _) ->
+            ([instr], OperandMap.remove dest current_consts, false)
+        | Call _ ->
+             (* 函数调用会修改 a0(返回值) 和可能的 other caller-saved registers, 这里简单处理 a0 *)
+            ([instr], OperandMap.remove (Reg "a0") current_consts, false)
+
+        (* 其他指令不影响常量传播，直接保留 *)
+        | _ -> ([instr], current_consts, false)
+      in
+      (acc_ir @ new_instr, new_consts, changed || made_change)
+    ) ([], consts, false) ir_list
   in
-  process_list ir_code
+
+  (* 迭代循环，直到没有优化发生 *)
+  let rec fixed_point_loop current_ir =
+    let (next_ir, _, changed) = propagate_constants_pass OperandMap.empty current_ir in
+    if changed then
+      fixed_point_loop next_ir
+    else
+      current_ir (* 达到不动点，返回最终结果 *)
+  in
+
+  fixed_point_loop ir_code
 
 
-  let ir_to_asm_list_internal (ir_instr: ir) : string list =
+(*******************************************************************
+ * 4. 从 IR 到 RISC-V 汇编的转换
+ *******************************************************************)
+let ir_to_asm_list_internal (ir_instr: ir) : string list =
   let is_small_imm i = i >= -2048 && i <= 2047 in
   let emit_mem_access op_str reg_name offset base_reg =
     if is_small_imm offset then
@@ -435,7 +513,7 @@ let optimize_ir (ir_code: ir list) : ir list =
   in
 
   match ir_instr with
-  | Label s -> [s ^ ":"] 
+  | Label s -> [s ^ ":"]
   | Li (dest, imm) ->
       let load_imm_ir = [Printf.sprintf "  li t6, %d" imm] in
       let store_ir = store_from_reg "t6" dest in
@@ -443,38 +521,38 @@ let optimize_ir (ir_code: ir list) : ir list =
   | Move (dest, src) ->
       let load_ir, src_reg_name = ensure_in_reg src "t6" in
       let store_ir = store_from_reg src_reg_name dest in
-      load_ir @ store_ir 
+      load_ir @ store_ir
   | Load (dest, src) ->
       (match src with
       | Stack i ->
           let load_val_ir = emit_mem_access "lw" "t6" i "fp" in
           let store_dest_ir = store_from_reg "t6" dest in
           load_val_ir @ store_dest_ir
-      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location") 
+      | _ -> failwith "FATAL: Source of Load must be fp-relative Stack location")
   | Store (src, dest) ->
       (match dest with
       | Stack i ->
           let load_src_ir, src_reg = ensure_in_reg src "t6" in
           let store_ir = emit_mem_access "sw" src_reg i "fp" in
           load_src_ir @ store_ir
-      | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location") 
+      | _ -> failwith "FATAL: Destination of Store must be fp-relative Stack location")
   | StoreOutArg (src, offset) ->
       let load_src_ir, src_reg = ensure_in_reg src "t6" in
       let store_ir = emit_mem_access "sw" src_reg offset "sp" in
-      load_src_ir @ store_ir 
+      load_src_ir @ store_ir
   | UnOp (op, dest, src) ->
       let op_str = match op with IR_Neg -> "neg"  | IR_Not -> "seqz"  in
       let load_ir, src_reg = ensure_in_reg src "t6" in
       let compute_ir = [Printf.sprintf "  %s t6, %s" op_str src_reg] in
       let store_ir = store_from_reg "t6" dest in
-      load_ir @ compute_ir @ store_ir 
+      load_ir @ compute_ir @ store_ir
 
   (*** MODIFIED, ROBUST BinOp ASSEMBLY LOGIC ***)
   | BinOp (op, dest, src1, src2) ->
       stack_temp_counter := 0; (* Reset temp register pool for each instruction *)
       let op_str = match op with
-        | IR_Add -> "add"  | IR_Sub -> "sub"  | IR_Mul -> "mul"  | IR_Div -> "div"  | IR_Mod -> "rem" 
-        | _ -> failwith "Invalid op for BinOp" 
+        | IR_Add -> "add"  | IR_Sub -> "sub"  | IR_Mul -> "mul"  | IR_Div -> "div"  | IR_Mod -> "rem"
+        | _ -> failwith "Invalid op for BinOp"
       in
 
       (* 1. Safely load both source operands into dedicated temp registers (t4, t5) *)
@@ -492,37 +570,38 @@ let optimize_ir (ir_code: ir list) : ir list =
 
   | BranchZ (src, label) ->
       let load_ir, reg = ensure_in_reg src "t6" in
-      load_ir @ [Printf.sprintf "  beqz %s, %s" reg label] 
+      load_ir @ [Printf.sprintf "  beqz %s, %s" reg label]
   | BranchNZ (src, label) ->
       let load_ir, reg = ensure_in_reg src "t6" in
-      load_ir @ [Printf.sprintf "  bnez %s, %s" reg label] 
+      load_ir @ [Printf.sprintf "  bnez %s, %s" reg label]
 
   (*** MODIFIED, ROBUST Branch ASSEMBLY LOGIC ***)
   | Branch (op, src1, src2, label) ->
       stack_temp_counter := 0; (* Reset temp register pool *)
       let branch_op_str = match op with
-        | IR_Eq -> "beq"  | IR_Neq -> "bne"  | IR_Lt -> "blt"  | IR_Le -> "ble"  | IR_Gt -> "bgt"  | IR_Ge -> "bge" 
-        | _ -> failwith "Invalid op for Branch" 
+        | IR_Eq -> "beq"  | IR_Neq -> "bne"  | IR_Lt -> "blt"  | IR_Le -> "ble"  | IR_Gt -> "bgt"  | IR_Ge -> "bge"
+        | _ -> failwith "Invalid op for Branch"
       in
       (* 1. Safely load both source operands into dedicated temp registers *)
       let (load1_ir, r1) = load_operand_to_temp src1 in
       let (load2_ir, r2) = load_operand_to_temp src2 in
-      
+
       (* 2. Perform the branch comparison *)
       let branch_ir = [Printf.sprintf "  %s %s, %s, %s" branch_op_str r1 r2 label] in
-      
+
+
       load1_ir @ load2_ir @ branch_ir
 
   (* ... All other cases from Jump to Epilogue remain the same ... *)
-  | Jump s -> [Printf.sprintf "  j %s" s] 
-  | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue" 
+  | Jump s -> [Printf.sprintf "  j %s" s]
+  | Ret -> failwith "Ret should not be directly converted, it's handled by Epilogue"
   | PreCall (stack_space) ->
       if stack_space > 0 then
         (if is_small_imm (-stack_space) then [Printf.sprintf "  addi sp, sp, -%d" stack_space]
          else [Printf.sprintf "  li t6, %d" stack_space; Printf.sprintf "  sub sp, sp, t6"])
       else []
   | Call s ->
-      [Printf.sprintf "  call %s" s] 
+      [Printf.sprintf "  call %s" s]
   | PostCall (stack_space) ->
       if stack_space > 0 then
         (if is_small_imm stack_space then [Printf.sprintf "  addi sp, sp, %d" stack_space]
@@ -542,7 +621,7 @@ let optimize_ir (ir_code: ir list) : ir list =
         if is_small_imm stack_size then
           [Printf.sprintf "  addi fp, sp, %d" stack_size]
         else
-          [Printf.sprintf "   li t6, %d" stack_size;
+          [Printf.sprintf "  li t6, %d" stack_size;
            Printf.sprintf "  add fp, sp, t6"]
       in
       [".text";
@@ -560,7 +639,7 @@ let optimize_ir (ir_code: ir list) : ir list =
       [".L_ret_" ^ fname ^ ":"] @ restore_fp @ restore_ra @ teardown_sp @ ["  ret"]
 
 (*******************************************************************
- * 4. 公共接口 (Public Interface)
+ * 5. 公共接口 (Public Interface)
  *******************************************************************)
 (* This section remains unchanged *)
 let string_of_ir (ir_instr: ir) : string =
@@ -609,11 +688,12 @@ let gen_assembly (ir_code: ir list) : string list =
     | Prologue (fname, _) -> current_fname := fname
     | Epilogue (fname, _) -> current_fname := fname
     | _ -> ());
-if ir = Ret then [Printf.sprintf "  j .L_ret_%s" !current_fname]
+    if ir = Ret then [Printf.sprintf "  j .L_ret_%s" !current_fname]
     else ir_to_asm_list_internal ir
   in
   List.concat_map convert_ir_to_asm ir_code
 
+(* 【修改】generate_code现在包含优化步骤 *)
 let generate_code (p: program) : string =
   (* 1. AST -> IR *)
   let ir = gen_program p in
