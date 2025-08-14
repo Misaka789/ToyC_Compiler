@@ -79,7 +79,7 @@ let def_block (blk : block_ir) : OperandSet.t * OperandSet.t =
   (final_def, final_use)
 
 
-  (* 主算法  *)
+  (* 活变量分析主算法  *)
   (* 经典的不动点迭代算法。 *)
   (* 活跃性信息是反向传播的，即从程序的末尾向开头流动。
   一个变量在某点是活跃的，取决于它是否在未来的路径上被使用。

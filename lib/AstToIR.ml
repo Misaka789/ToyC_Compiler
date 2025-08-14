@@ -1,7 +1,7 @@
 (* lib/AstToIR.ml  *)
 open Ast
 open Ir
-open Op
+open Optimize
 
 (* --- 模块与类型定义 --- *)
 module Enwli = Map.Make (String)

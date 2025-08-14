@@ -1,5 +1,5 @@
 open Ir
-open Reg
+open LinearReg
 
 (* --- 模块级状态和配置 --- *)
 
