@@ -1,7 +1,7 @@
 (executable
+ (public_name Toyc)
  (name main)
- (modules main)
- (public_name toyc_compiler)
- (libraries toyc_compiler_lib)
- (modes byte exe)
- (flags (:standard -g)))
+ (libraries compilerlib)
+ (flags
+  (:standard -w -32-27-26-39-8-37))
+ (modes byte exe))

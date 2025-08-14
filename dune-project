@@ -1,19 +1,26 @@
-(lang dune 3.17)
+(lang dune 3.19)
 
-(name toyc_compiler)
-
-(using menhir 2.0)
+(name Toyc)
 
 (generate_opam_files true)
 
+(source
+ (github username/reponame))
+
+(authors "Author Name <author@example.com>")
+
+(maintainers "Maintainer Name <maintainer@example.com>")
+
+(license LICENSE)
+
+(documentation https://url/to/documentation)
+
 (package
- (name toyc_compiler)
- (depends
-  (ocaml
-   (>= 4.14.0))
-  (dune
-   (>= 3.0))
-  menhir
-  menhirlib
-  ounit2
-  with-test))
+ (name Toyc)
+ (synopsis "A short synopsis")
+ (description "A longer description")
+ (depends ocaml)
+ (tags
+  ("add topics" "to describe" your project)))
+
+; See the complete stanza docs at https://dune.readthedocs.io/en/stable/reference/dune-project/index.html
