@@ -1,5 +1,10 @@
+(* lib/op.ml *)
+(* 优化寄存器分配————实现活性分析*)
+(* 通过数据流分析确定程序中每个基本块的活跃变量集合。 *)
+
 open Ir
 
+(* 辅助函数，打印。 *)
 let pri_oper op =
   match op with
   | Var v -> v
@@ -16,14 +21,10 @@ let pri_info blocks =
         (String.concat ", " (List.map pri_oper (OperandSet.elements blk.l_out))))
     blocks
 
-let def_termin = function
-  | TermRet (Some op) ->
-      (OperandSet.empty, (match op with Imm _ -> OperandSet.empty | _ -> OperandSet.singleton op))
-  | TermRet None -> (OperandSet.empty, OperandSet.empty)
-  | TermIf (cond, _, _) ->
-      (OperandSet.empty, (match cond with Imm _ -> OperandSet.empty | _ -> OperandSet.singleton cond))
-  | TermGoto _ | TermSeq _ -> (OperandSet.empty, OperandSet.empty)
-let def_inst (inst : inst_r) : OperandSet.t * OperandSet.t =
+
+
+(* 计算单条指令的 def 和 use 集合，返回一个元组 (def_set, use_set) *)
+let def_inst (inst : inst_ir) : OperandSet.t * OperandSet.t =
   let op_set op = match op with Imm _ -> OperandSet.empty | _ -> OperandSet.singleton op in
   let args_set args =
     List.fold_left
@@ -31,7 +32,7 @@ let def_inst (inst : inst_r) : OperandSet.t * OperandSet.t =
       OperandSet.empty args
   in
   match inst with
-  | Binop (_, dst, lhs, rhs) ->
+  | Binop (_, dst, lhs, rhs) ->(*目标操作数 dst 被定义，源操作数 lhs 和 rhs 被使用 。*)
       (OperandSet.singleton dst, OperandSet.union (op_set lhs) (op_set rhs))
   | Unop (_, dst, src) ->
       (OperandSet.singleton dst, op_set src)
@@ -50,7 +51,18 @@ let def_inst (inst : inst_r) : OperandSet.t * OperandSet.t =
   | IfGoto (cond, _) -> (OperandSet.empty, op_set cond)
   | Goto _ | Label _ -> (OperandSet.empty, OperandSet.empty)
 
-let def_block (blk : block_r) : OperandSet.t * OperandSet.t =
+(* 与 def_inst 类似，但专门处理基本块的终结符指令  *)
+let def_termin = function
+  | TermRet (Some op) ->
+      (OperandSet.empty, (match op with Imm _ -> OperandSet.empty | _ -> OperandSet.singleton op))
+  | TermRet None -> (OperandSet.empty, OperandSet.empty)
+  | TermIf (cond, _, _) ->
+      (OperandSet.empty, (match cond with Imm _ -> OperandSet.empty | _ -> OperandSet.singleton cond))
+  | TermGoto _ | TermSeq _ -> (OperandSet.empty, OperandSet.empty)
+
+
+(* 聚合块内所有指令和终结符的 def/use 集合，计算整个基本块的 def 和 use 集合 。 *)
+let def_block (blk : block_ir) : OperandSet.t * OperandSet.t =
   let defs, uses =
     List.fold_right
       (fun inst (defs, uses) ->
@@ -66,8 +78,14 @@ let def_block (blk : block_r) : OperandSet.t * OperandSet.t =
   let final_def = OperandSet.union defs term_def in
   (final_def, final_use)
 
-  
-let liv_analy (blocks : block_r list) (print_liveness : bool) : unit =
+
+  (* 主算法  *)
+  (* 经典的不动点迭代算法。 *)
+  (* 活跃性信息是反向传播的，即从程序的末尾向开头流动。
+  一个变量在某点是活跃的，取决于它是否在未来的路径上被使用。
+  算法通过不断迭代，直到所有块的 l_in 和 l_out 集合不再变化，
+  达到一个“不动点”为止。 *)
+let liv_analy (blocks : block_ir list) (print_liveness : bool) : unit =
   let changed = ref true in
   List.iter
     (fun blk ->

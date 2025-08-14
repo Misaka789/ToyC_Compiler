@@ -1,17 +1,27 @@
 (* lib/cfg.ml *)
+(* 实现了一个编译器优化流程 *)
+(* 1.构建CFG并移除不可达的基本块（死代码消除）。
+2.在CFG上执行常量传播和常量折叠优化。 *)
+
 open Ir
 
 module S_set = Set.Make(String)
 module S_map = Map.Make(String)
 
+(* 定义变量在常量传播分析中的状态 *)
 type const_state = int option;;
+(* "常量环境"，从变量名（string）到其 const_state 的映射 *)
 type const_env = const_state S_map.t;;
 
+
+(* 辅助函数，用于模拟32位整数的环绕算术 *)
+(* 通过与 0xFFFFFFFF 进行按位与操作来实现 。这在常量折叠算术运算时确保了与目标机器的行为一致。 *)
 let w_mod n =
     let m = Int32.of_int n in
     Int32.to_int (Int32.logand m 0xFFFFFFFFl)
 ;;
 
+(* 常量传播 *)
 let e_oper env op =
   match op with
   | Var name | Reg name ->
@@ -22,7 +32,13 @@ let e_oper env op =
   | Imm _ -> op
 ;;
 
+
+(* 负责将一个线性的基本块列表 block_r list 
+转换成一个带有正确前驱和后继信息的图结构，并移除不可达代码。 *)
 let b_cfg (blocks : block_r list) : block_r list =
+  (* 步骤 1: 建立边 *)
+  (* 为每个块建立前驱和后继关系。 *)
+  (* 如果 blocks 为空，则直接返回空列表。 *)
   if blocks = [] then [] else
   let label_map =
     List.fold_left (fun m b -> S_map.add b.label b m) S_map.empty blocks
@@ -42,6 +58,10 @@ let b_cfg (blocks : block_r list) : block_r list =
     | TermIf (_, l1, l2) -> add_edge b.label l1; add_edge b.label l2
     | TermRet _          -> ()
   ) blocks;
+
+  (* 步骤 2: 移除不可达块 *)
+  (* 使用深度优先搜索（DFS）来找到所有可达的块。 *)
+  
   let entry_label = (List.hd blocks).label in
   let visited = Hashtbl.create (List.length blocks) in
   let rec dfs lbl =
@@ -62,6 +82,8 @@ let b_cfg (blocks : block_r list) : block_r list =
   reachable
 ;;
 
+(* 该函数是数据流分析中的“交汇（meet）”操作符。
+当一个基本块有多个前驱时，需要将这些前驱的出口环境合并，作为当前块的入口环境。 *)
 let m_envs (envs : const_env list) : const_env =
   if envs = [] then S_map.empty
   else
@@ -83,6 +105,7 @@ let m_envs (envs : const_env list) : const_env =
       ) all_vars S_map.empty
 ;;
 
+(* 常量折叠：二元运算 *)
 let e_binop op op1 op2 =
   match (op1, op2) with
   | (Imm a, Imm b) ->
@@ -102,6 +125,7 @@ let e_binop op op1 op2 =
   | _ -> None
 ;;
 
+(* 常量折叠2：一元运算 *)
 let eval_unop op op1 =
   match op1 with
   | Imm a ->
@@ -113,6 +137,8 @@ let eval_unop op op1 =
   | _ -> None
 ;;
 
+(* 数据流分析的“传递函数”，用于计算一条指令如何改变常量环境。 *)
+(* 常量传播和折叠后更新环境和指令 *)
 let p_inst env inst =
   match inst with
   | TailCall _ ->
@@ -166,6 +192,7 @@ let p_inst env inst =
   | Goto _ | Label _ as t -> t, env
 ;;
 
+(* 处理块的终结符的传递函数 *)
 let termina env term =
   match term with
   | TermIf (cond, l1, l2) -> TermIf (e_oper env cond, l1, l2)
@@ -173,6 +200,9 @@ let termina env term =
   | TermGoto _ | TermSeq _ as t -> t
 ;;
 
+
+
+(* 主算法：常量传播和折叠 *)
 let const_pro (blocks : block_r list) : block_r list =
   let b_map = List.fold_left (fun m b -> S_map.add b.label b m) S_map.empty blocks in
   let i_envs = ref S_map.empty in
@@ -208,6 +238,7 @@ let const_pro (blocks : block_r list) : block_r list =
   blocks
 ;;
 
+(* 顶层函数 *)
 let opt blocks =
   blocks |> b_cfg |> const_pro
 ;;
