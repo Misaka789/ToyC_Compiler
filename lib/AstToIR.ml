@@ -174,7 +174,7 @@ let pre_ast (pro : Ast.program) : Ast.program =
 (* 识别并删除简单的自增循环，将其替换为空块  *)
 let rec tri_self_loop stmt =
   match stmt with
-  | While (Binop (Less, ID var, Number _), Block [ Assign (var2, Binop (Add, ID var3, Number 1)) ])
+  | While (BinOp (Lt, Id var, IntLiteral _), Block [ Assign (var2, BinOp (Add, Id var3, IntLiteral 1)) ])
     when var = var2 && var = var3 -> Block []
   | Block stmts -> Block (stmts |> List.map tri_self_loop |> List.filter (function Block [] -> false | _ -> true))
   | If (cond, s1, s2_opt) -> If (cond, tri_self_loop s1, Option.map tri_self_loop s2_opt)
@@ -185,19 +185,19 @@ let rec tri_self_loop stmt =
 (* 识别特定的嵌套循环模式，并将内层循环的累加操作转换成一次乘法运算 *)
 let rec el_loop (stmt : stmt) : stmt =
   match stmt with
-  | While (Binop (Less, ID idx, Number n), Block body) ->
+  | While (BinOp (Lt, Id idx, IntLiteral n), Block body) ->
     let match_loop stmts =
       match stmts with
-      | Decl (k_name, Some (Number 0)) :: assigns_before
-        when List.exists (function Ast.Assign (_, Number 0) -> true | _ -> false) assigns_before ->
-        let a_inst, rest = List.partition (function Ast.Assign (_, Number 0) -> true | _ -> false) assigns_before in
-        let acc_names = List.filter_map (function Ast.Assign (name, Number 0) -> Some name | _ -> None) a_inst in
+      | ValDecl (k_name, Some (IntLiteralr 0)) :: assigns_before
+        when List.exists (function Ast.Assign (_, IntLiteral 0) -> true | _ -> false) assigns_before ->
+        let a_inst, rest = List.partition (function Ast.Assign (_, IntLiteral 0) -> true | _ -> false) assigns_before in
+        let acc_names = List.filter_map (function Ast.Assign (name, IntLiteral 0) -> Some name | _ -> None) a_inst in
         (match rest with
-         | While (Binop (Less, ID k_id, Number m), Block inner_body) :: tail when k_id = k_name ->
+         | While (BinOp (Lt, Id k_id, IntLiteral m), Block inner_body) :: tail when k_id = k_name ->
            let vaild_expr =
              List.filter_map
                (function
-                 | Ast.Assign (acc, Binop (Add, ID acc2, expr)) when acc = acc2 && List.mem acc acc_names -> Some (acc, expr)
+                 | Ast.Assign (acc, BinOp (Add, Id acc2, expr)) when acc = acc2 && List.mem acc acc_names -> Some (acc, expr)
                  | _ -> None)
                inner_body
            in
@@ -208,11 +208,11 @@ let rec el_loop (stmt : stmt) : stmt =
     in
     (match match_loop body with
      | Some (k_var, m, acc_exprs, tail_after_loop) ->
-       let new_accs = List.map (fun (acc, expr) -> Ast.Assign (acc, Binop (Mul, expr, Number m))) acc_exprs in
-       let k_decl = if List.exists (uvar_stmt k_var) tail_after_loop then [ Decl (k_var, Some (Number 0)) ] else [] in
+       let new_accs = List.map (fun (acc, expr) -> Ast.Assign (acc, BinOp (Mul, expr, IntLiteral m))) acc_exprs in
+       let k_decl = if List.exists (uvar_stmt k_var) tail_after_loop then [ ValDecl (k_var, Some (IntLiteral 0)) ] else [] in
        let new_body = Block (k_decl @ new_accs @ List.map el_loop tail_after_loop) in
-       While (Binop (Less, ID idx, Number n), new_body)
-     | None -> While (Binop (Less, ID idx, Number n), Block (List.map el_loop body)))
+       While (BinOp (Lt, Id idx, IntLiteral n), new_body)
+     | None -> While (BinOp (Lt, Id idx, IntLiteral n), Block (List.map el_loop body)))
   | While (cond, Block body) -> While (cond, Block (List.map el_loop body))
   | Block stmts -> Block (List.map el_loop stmts)
   | If (cond, t_branch, f_branch) -> If (cond, el_loop t_branch, Option.map el_loop f_branch)
@@ -225,7 +225,7 @@ let el_loopfunc (f : func_def) : func_def =
   { f with body = new_body }
 ;;
 (* 将 el_loopfunc 应用于整个程序的所有函数  *)
-let loop_elim_ast (cu : comp_unit) : comp_unit = List.map el_loopfunc cu
+let loop_elim_ast (pro : program) : program = List.map el_loopfunc pro
 
 
 (* --------------IR 生成与辅助函数--------------- *)
@@ -276,24 +276,24 @@ let string_of_binop = function
 它会为子表达式的结果生成临时寄存器，并返回最终结果所在的 operand 和一系列新生成的指令 。 *)
 let rec expr_ir (ctx : text) (e : expr) : operand * inst_r list =
   match e with
-  | Number n -> (Imm n, [])
-  | ID name ->
+  | IntLiteral n -> (Imm n, [])
+  | Id name ->
     let operand = Estack.l_up name !(ctx.e_stack) in
     (operand, [])
-  | Unop (op, e1) ->
+  | UnOp (op, e1) ->
     let operand, code = expr_ir ctx e1 in
     let res = fr_temp () in
-    (res, code @ [ Unop (string_of_unop op, res, operand) ])
-  | Binop (op, e1, e2) ->
+    (res, code @ [ UnOp (string_of_unop op, res, operand) ])
+  | BinOp (op, e1, e2) ->
     let lhs, c1 = expr_ir ctx e1 in
     let rhs, c2 = expr_ir ctx e2 in
     (match op with
      | Land | Lor ->
        let dst = fr_temp () in
-       (dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ])
+       (dst, c1 @ c2 @ [ BinOp (string_of_binop op, dst, lhs, rhs) ])
      | _ ->
        let dst = fr_temp () in
-       (dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ]))
+       (dst, c1 @ c2 @ [ BinOp (string_of_binop op, dst, lhs, rhs) ]))
   | Call (f, args) ->
     let arg_op_pairs = List.map (expr_ir ctx) args in
     let oprs, codes_list = List.split arg_op_pairs in
@@ -310,18 +310,18 @@ let junp_return insts = match List.rev insts with Goto _ :: _ | Ret _ :: _ -> tr
 (* ------------布尔表达式规范化------------ *)
 (* 使用德摩根定律等规则，将 ! 运算符尽可能地向表达式内部推，并转换关系运算符 *)
 let rec nor_expr = function
-  | Ast.Unop (Not, Unop (Not, e)) -> nor_expr e
-  | Unop (Not, Binop (Land, a, b)) -> nor_expr (Binop (Lor, Unop (Not, a), Unop (Not, b)))
-  | Unop (Not, Binop (Lor, a, b)) -> nor_expr (Binop (Land, Unop (Not, a), Unop (Not, b)))
-  | Unop (Not, Binop (op, a, b)) ->
+  | Ast.UnOp (Not, UnOp (Not, e)) -> nor_expr e
+  | UnOp (Not, BinOp (And, a, b)) -> nor_expr (BinOp (Or, UnOp (Not, a), UnOp (Not, b)))
+  | UnOp (Not, BinOp (Or, a, b)) -> nor_expr (BinOp (And, UnOp (Not, a), UnOp (Not, b)))
+  | UnOp (Not, BinOp (op, a, b)) ->
     let neg =
       match op with
-      | Eq -> Neq | Neq -> Eq | Less -> Geq | Leq -> Greater | Greater -> Leq | Geq -> Less
+      | Eq -> Neq | Neq -> Eq | Lt -> Ge | Le -> Gt | Gt -> Le | Ge -> Lt
       | _ -> failwith "unsupported negation of this binary op"
     in
-    Ast.Binop (neg, nor_expr a, nor_expr b)
-  | Binop (op, a, b) -> Binop (op, nor_expr a, nor_expr b)
-  | Unop (op, a) -> Unop (op, nor_expr a)
+    Ast.BinOp (neg, nor_expr a, nor_expr b)
+  | BinOp (op, a, b) -> BinOp (op, nor_expr a, nor_expr b)
+  | UnOp (op, a) -> UnoOp (op, nor_expr a)
   | Call (f, args) -> Call (f, List.map nor_expr args)
   | e -> e
 
@@ -374,15 +374,14 @@ let rec des_stmt = function
   (* 语句翻译：递归地将一个 AST 语句（stmt）翻译成 IR 指令 *)
 let rec stmt_res (ctx : text) (in_tail : bool) (s : stmt) : stmt_res =
   match s with
-  | Empty -> Normal []
-  | ExprStmt e ->
+  | Expr e ->
     let _, code = expr_ir ctx e in
     Normal code
-  | Decl (x, None) ->
+  | ValDecl (x, None) ->
     let new_name = fr_name x in
     ctx.e_stack := Estack.add x (Var new_name) !(ctx.e_stack);
     Normal []
-  | Decl (x, Some e) ->
+  | ValDecl (x, Some e) ->
     let v, c = expr_ir ctx e in
     let new_name = fr_name x in
     ctx.e_stack := Estack.add x (Var new_name) !(ctx.e_stack);
