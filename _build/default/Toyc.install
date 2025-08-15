@@ -1,0 +1,8 @@
+lib: [
+  "_build/install/default/lib/Toyc/META"
+  "_build/install/default/lib/Toyc/dune-package"
+  "_build/install/default/lib/Toyc/opam"
+]
+bin: [
+  "_build/install/default/bin/Toyc"
+]
