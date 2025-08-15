@@ -18,11 +18,11 @@ module IrToAsm = Compilerlib__IrToAsm
 (** @canonical Compilerlib.Lexer *)
 module Lexer = Compilerlib__Lexer
 
-(** @canonical Compilerlib.Op *)
-module Op = Compilerlib__Op
+(** @canonical Compilerlib.Linearscan *)
+module Linearscan = Compilerlib__Linearscan
+
+(** @canonical Compilerlib.Liveness *)
+module Liveness = Compilerlib__Liveness
 
 (** @canonical Compilerlib.Parser *)
 module Parser = Compilerlib__Parser
-
-(** @canonical Compilerlib.Reg *)
-module Reg = Compilerlib__Reg

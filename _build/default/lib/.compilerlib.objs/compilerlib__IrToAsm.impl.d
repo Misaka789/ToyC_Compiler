@@ -1,1 +1,1 @@
-lib/IrToAsm.ml: Array Hashtbl Ir List O_hash Op OperandSet Printf Reg String
+lib/irToAsm.ml: Array Hashtbl Ir Linearscan List Liveness O_hash OperandSet Printf String
