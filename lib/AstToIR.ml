@@ -3,14 +3,15 @@ open Ast
 open Ir
 open Liveness
 
-(* --- 模块与类型定义 (使用原始名称) --- *)
-module Enwli = Map.Make (String)
+(* --- 模块与类型定义 --- *)
+module EnvMap = Map.Make (String)
 
+(* 管理变量作用域的栈 *)
 module Estack = struct
-  type t = operand Enwli.t list
+  type t = operand EnvMap.t list
 
-  let empty : t = [ Enwli.empty ]
-  let enter (stk : t) : t = Enwli.empty :: stk
+  let empty : t = [ EnvMap.empty ]
+  let enter (stk : t) : t = EnvMap.empty :: stk
 
   let exit = function
     | _ :: tl -> tl
@@ -18,19 +19,20 @@ module Estack = struct
   ;;
 
   let add name v = function
-    | top :: tl -> Enwli.add name v top :: tl
+    | top :: tl -> EnvMap.add name v top :: tl
     | [] -> failwith "Estack.add: empty stack"
   ;;
-
-  let rec l_up name = function
+ (* 从当前作用域开始，向外层作用域递归查找一个变量的定义 *)
+  let rec lookup_var name = function
     | [] -> failwith ("unbound variable: " ^ name)
     | m :: ms ->
-      (match Enwli.find_opt name m with
+      (match EnvMap.find_opt name m with
        | Some v -> v
-       | None -> l_up name ms)
+       | None -> lookup_var name ms)
   ;;
 end
 
+(* 上下文记录，用于在递归翻译时传递状态 *)
 type text = {
   func_name : string;
   e_stack : Estack.t ref;
@@ -40,35 +42,40 @@ type text = {
 
 module S_set = Set.Make (String)
 
-let rec side_effecte = function
+(* 递归地检查一个expr是否具有副作用。
+目前只认为函数调用 (Ast.Call) 具有副作用 。 *)
+let rec expr_has_side_effects = function
   | Ast.Call _ -> true
-  | Ast.Unop (_, e) -> side_effecte e
-  | Ast.Binop (_, l, r) -> side_effecte l || side_effecte r
+  | Ast.Unop (_, e) -> expr_has_side_effects e
+  | Ast.Binop (_, l, r) -> expr_has_side_effects l || expr_has_side_effects r
   | _ -> false
 ;;
 
-let rec side_effects = function
-  | Ast.ExprStmt e -> side_effecte e
+(* stmt *)
+let rec stmt_has_side_effects = function
+  | Ast.ExprStmt e -> expr_has_side_effects e
   | Ast.Return _ -> true
   | Ast.Break | Ast.Continue -> true
   | Ast.If (_, t, f) ->
-    side_effects t
+    stmt_has_side_effects t
     || (match f with
-        | Some f -> side_effects f
+        | Some f -> stmt_has_side_effects f
         | None -> false)
-  | Ast.While (_, b) -> side_effects b
-  | Ast.Block ss -> List.exists side_effects ss
+  | Ast.While (_, b) -> stmt_has_side_effects b
+  | Ast.Block ss -> List.exists stmt_has_side_effects ss
   | _ -> false
 ;;
 
-let rec c_while = function
+(* 递归地检查一个语句列表（stmts）中是否包含 While 循环 。 *)
+let rec contains_while = function
   | [] -> false
   | Ast.While _ :: _ -> true
-  | Ast.Block ss :: rest -> c_while ss || c_while rest
-  | _ :: rest -> c_while rest
+  | Ast.Block ss :: rest -> contains_while ss || contains_while rest
+  | _ :: rest -> contains_while rest
 ;;
 
-let rec uvar_stmt name stmt =
+(* 检查一个给定的变量名 (name) 是否在某个语句 (stmt) 中被使用 *)
+let rec uses_var_in_stmt name stmt =
   let rec uvar_expr name = function
     | ID id -> id = name
     | Binop (_, e1, e2) -> uvar_expr name e1 || uvar_expr name e2
@@ -82,12 +89,12 @@ let rec uvar_stmt name stmt =
   | ExprStmt e -> uvar_expr name e
   | If (cond, s1, s2_opt) ->
     uvar_expr name cond
-    || uvar_stmt name s1
+    || uses_var_in_stmt name s1
     || (match s2_opt with
-        | Some s2 -> uvar_stmt name s2
+        | Some s2 -> uses_var_in_stmt name s2
         | None -> false)
-  | While (cond, s) -> uvar_expr name cond || uvar_stmt name s
-  | Block ss -> List.exists (uvar_stmt name) ss
+  | While (cond, s) -> uvar_expr name cond || uses_var_in_stmt name s
+  | Block ss -> List.exists (uses_var_in_stmt name) ss
   | _ -> false
 ;;
 
@@ -120,14 +127,16 @@ let rec vars_stmt =
   | _ -> S_set.empty
 ;;
 
-let rec r_while stmts =
+(* 死循环消除 *)
+(* 移除那些没有副作用（如函数调用）且其修改的变量在循环外不会被再次读取的 while 循环  *)
+let rec remove_while stmts =
   let rec go acc = function
     | [] -> List.rev acc
     | stmt :: rest ->
       let keep1 =
         match stmt with
         | Ast.While (_, body) ->
-          let se = side_effects body in
+          let se = stmt_has_side_effects body in
           let writes = vars_stmt body in
           let future_reads =
             List.fold_left (fun s st -> S_set.union s (vars_stmt st)) S_set.empty rest
@@ -140,7 +149,7 @@ let rec r_while stmts =
         if keep1 then
           let stmt' =
             match stmt with
-            | Ast.Block ss -> Ast.Block (r_while ss)
+            | Ast.Block ss -> Ast.Block (remove_while ss)
             | other -> other
           in
           stmt' :: acc
@@ -152,9 +161,12 @@ let rec r_while stmts =
 ;;
 
 let pre_ast (cu : Ast.comp_unit) : Ast.comp_unit =
-  List.map (fun f -> if c_while f.Ast.body then { f with Ast.body = r_while f.body } else f) cu
+  List.map (fun f -> if contains_while f.Ast.body then { f with Ast.body = remove_while f.body } else f) cu
 ;;
 
+(* ----------特定循环模式消除---------- *)
+
+(* 识别并删除简单的自增循环，将其替换为空块  *)
 let rec tri_self_loop stmt =
   match stmt with
   | While (Binop (Less, ID var, Number _), Block [ Assign (var2, Binop (Add, ID var3, Number 1)) ])
@@ -164,6 +176,8 @@ let rec tri_self_loop stmt =
   | While (cond, Block body) -> While (cond, Block (List.map tri_self_loop body))
   | other -> other
 
+(* 循环展开与强度削减 *)
+(* 识别特定的嵌套循环模式，并将内层循环的累加操作转换成一次乘法运算 *)
 let rec el_loop (stmt : stmt) : stmt =
   match stmt with
   | While (Binop (Less, ID idx, Number n), Block body) ->
@@ -190,7 +204,7 @@ let rec el_loop (stmt : stmt) : stmt =
     (match match_loop body with
      | Some (k_var, m, acc_exprs, tail_after_loop) ->
        let new_accs = List.map (fun (acc, expr) -> Ast.Assign (acc, Binop (Mul, expr, Number m))) acc_exprs in
-       let k_decl = if List.exists (uvar_stmt k_var) tail_after_loop then [ Decl (k_var, Some (Number 0)) ] else [] in
+       let k_decl = if List.exists (uses_var_in_stmt k_var) tail_after_loop then [ Decl (k_var, Some (Number 0)) ] else [] in
        let new_body = Block (k_decl @ new_accs @ List.map el_loop tail_after_loop) in
        While (Binop (Less, ID idx, Number n), new_body)
      | None -> While (Binop (Less, ID idx, Number n), Block (List.map el_loop body)))
@@ -200,6 +214,7 @@ let rec el_loop (stmt : stmt) : stmt =
   | _ -> stmt
 ;;
 
+ (* 将 el_loop 和 tri_self_loop 优化应用于单个函数体 *)
 let el_loopfunc (f : func_def) : func_def =
   let new_body = f.body |> List.map el_loop |> List.map tri_self_loop in
   { f with body = new_body }
@@ -207,25 +222,29 @@ let el_loopfunc (f : func_def) : func_def =
 
 let loop_elim_ast (cu : comp_unit) : comp_unit = List.map el_loopfunc cu
 
+(* --------------IR 生成与辅助函数--------------- *)
 module LabelMap = Map.Make (String)
 
+(* 生成一个唯一的临时寄存器 *)
 let temp_id = ref 0
-let fr_temp () =
+let fresh_temp () =
   incr temp_id;
   Reg ("t" ^ string_of_int !temp_id)
 
+(* 为一个基础名字（base）生成一个唯一的内部名称 *)
 let name_id = ref 0
 let fr_name base =
   incr name_id;
   base ^ "_" ^ string_of_int !name_id
 
+(* 生成一个唯一的标签字符串 *)
 let la_id = ref 0
 let ir_label_id = ref 0
-
 let fr_label () =
   incr la_id;
   "L" ^ string_of_int !la_id
 
+(* 为一个高级标签（param）查找或创建一个唯一的 IR 级标签（如 "LABEL1"），并维护一个从高级标签到 IR 标签的映射表 。 *)
 let frir_label (label_map : string LabelMap.t) (l : param) : string * string LabelMap.t =
   match LabelMap.find_opt l label_map with
   | Some lbl -> lbl, label_map
@@ -236,39 +255,43 @@ let frir_label (label_map : string LabelMap.t) (l : param) : string * string Lab
     let label_map' = LabelMap.add l lbl label_map in
     lbl, label_map'
 
+(* 转换成字符串表示 *)
 let string_of_unop = function
   | Not -> "!" | Plus -> "+" | Minus -> "-"
-
 let string_of_binop = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
   | Eq -> "==" | Neq -> "!=" | Less -> "<" | Leq -> "<=" | Greater -> ">"
   | Geq -> ">=" | Land -> "&&" | Lor -> "||"
 
+(* ===============AST 到 IR 核心翻译============= *)
+
+(* 表达式翻译：递归地将一个 AST 表达式（expr）翻译成 IR 指令。
+它会为子表达式的结果生成临时寄存器，并返回最终结果所在的 operand 和一系列新生成的指令 。 *)
 let rec expr_ir (ctx : text) (e : expr) : operand * inst_r list =
   match e with
   | Number n -> (Imm n, [])
   | ID name ->
-    let operand = Estack.l_up name !(ctx.e_stack) in
+    let operand = Estack.lookup_var name !(ctx.e_stack) in
     (operand, [])
   | Unop (op, e1) ->
     let operand, code = expr_ir ctx e1 in
-    let res = fr_temp () in
+    let res = fresh_temp () in
     (res, code @ [ Unop (string_of_unop op, res, operand) ])
   | Binop (op, e1, e2) ->
     let lhs, c1 = expr_ir ctx e1 in
     let rhs, c2 = expr_ir ctx e2 in
     (match op with
      | Land | Lor ->
-       let dst = fr_temp () in
+       let dst = fresh_temp () in
        (dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ])
      | _ ->
-       let dst = fr_temp () in
+       let dst = fresh_temp () in
        (dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ]))
   | Call (f, args) ->
     let arg_op_pairs = List.map (expr_ir ctx) args in
     let oprs, codes_list = List.split arg_op_pairs in
     let codes = List.concat codes_list in
-    let ret = fr_temp () in
+    let ret = fresh_temp () in
     (ret, codes @ [ Call (ret, f, oprs) ])
 
 type stmt_res = Returned of inst_r list | Normal of inst_r list
@@ -277,6 +300,8 @@ let flatten = function Returned code | Normal code -> code
 let always_returns = function Returned _ -> true | Normal _ -> false
 let junp_return insts = match List.rev insts with Goto _ :: _ | Ret _ :: _ -> true | _ -> false
 
+(* ------------布尔表达式规范化------------ *)
+(* 使用德摩根定律等规则，将 ! 运算符尽可能地向表达式内部推，并转换关系运算符 *)
 let rec nor_expr = function
   | Ast.Unop (Not, Unop (Not, e)) -> nor_expr e
   | Unop (Not, Binop (Land, a, b)) -> nor_expr (Binop (Lor, Unop (Not, a), Unop (Not, b)))
@@ -293,6 +318,7 @@ let rec nor_expr = function
   | Call (f, args) -> Call (f, List.map nor_expr args)
   | e -> e
 
+(* 将复杂的逻辑与（&&）和逻辑或（||）表达式分解成嵌套的 if-then-else 结构，以便于后续翻译 *)
 let rec des_stmt = function
   | If (cond, then_b, Some else_b) ->
     let cond = nor_expr cond in
@@ -338,6 +364,7 @@ let rec des_stmt = function
   | Block ss -> Block (List.map des_stmt ss)
   | other -> other
 
+  (* 语句翻译：递归地将一个 AST 语句（stmt）翻译成 IR 指令 *)
 let rec stmt_res (ctx : text) (in_tail : bool) (s : stmt) : stmt_res =
   match s with
   | Empty -> Normal []
@@ -355,7 +382,7 @@ let rec stmt_res (ctx : text) (in_tail : bool) (s : stmt) : stmt_res =
     Normal (c @ [ Assign (Var new_name, v) ])
   | Assign (x, e) ->
     let v, c = expr_ir ctx e in
-    let var = Estack.l_up x !(ctx.e_stack) in
+    let var = Estack.lookup_var x !(ctx.e_stack) in
     Normal (c @ [ Assign (var, v) ])
   | Return None -> if in_tail then Returned [] else Returned [ Ret None ]
   | Return (Some e) ->
@@ -418,6 +445,10 @@ let rec stmt_res (ctx : text) (in_tail : bool) (s : stmt) : stmt_res =
     ctx.e_stack := Estack.exit !(ctx.e_stack);
     res
 
+ (* ==================IR 结构化与优化==================== *)
+
+  (* 构建控制流图 *)
+  (* par_block 函数将线性的指令流根据 Label 和跳转指令切分成基本块（block_r），构建控制流图的第一步 *)
 let par_block (insts : inst_r list) : block_r list =
   let rec split acc curr label label_map insts =
     match insts with
@@ -454,7 +485,7 @@ let par_block (insts : inst_r list) : block_r list =
 let func_ir (f : func_def) : func_r =
   let des_body = match des_stmt (Block f.body) with Block ss -> ss | _ -> f.body in
   let f' = { f with body = des_body } in
-  let i_env = List.fold_left (fun m p -> Enwli.add p (Var p) m) Enwli.empty f'.params in
+  let i_env = List.fold_left (fun m p -> EnvMap.add p (Var p) m) EnvMap.empty f'.params in
   let ctx0 = { func_name = f'.func_name; e_stack = ref [ i_env ]; breakb = None; continueb = None } in
   let raw_res = stmt_res ctx0 false (Block f'.body) in
   let raw_code = flatten raw_res in
@@ -472,6 +503,8 @@ let func_ir (f : func_def) : func_r =
   in
   { name = f'.func_name; args = f'.params; body = final_code }
 
+(* ----------IR 优化函数-------- *)
+(* 检查一条 IR 指令是否具有副作用 *)
 let has_effect inst =
   match inst with
   | Call _ | Store _ | Ret _ -> true
@@ -483,6 +516,8 @@ module E_map = Map.Make (struct
   let compare = compare
 end)
 
+(* 执行公共子表达式消除 *)
+(* 缓存二元运算的结果，并在后续遇到相同运算时重用结果 *)
 let cse_block (blk : block_r) : block_r =
   let expr_table = ref E_map.empty in
   let new_insts =
@@ -506,6 +541,8 @@ let cse_block (blk : block_r) : block_r =
   in
   { blk with insts = new_insts }
 
+ (* 执行死代码消除 *)
+  (* 首先运行存活变量分析，然后反向遍历基本块，移除那些没有副作用且其定义（写入）的变量在之后不被使用的指令 。 *)
 let dcode_elim blocks (print_l : bool) =
   run_liveness_analysis blocks print_l;
   List.map
@@ -543,6 +580,8 @@ let rec res_copy env op =
      | _ -> op)
   | _ -> op
 
+(* 执行拷贝传播 *)
+(* 将形如 y = x 的赋值记录下来，并用 x 替换后续对 y 的使用，同时移除冗余的赋值指令  *)
 let copy_block (blk : block_r) : block_r =
   let copy_env = ref O_map.empty in
   let propagate_op op = res_copy !copy_env op in
@@ -576,10 +615,12 @@ let copy_block (blk : block_r) : block_r =
   in
   { blk with insts = new_insts }
 
+ (* ！！优化版本 *)
+  (* pipeline：翻译成线性 IR -> 构建 CFG -> 执行死代码消除 -> 公共子表达式消除 -> 拷贝传播 -> 再次死代码消除 。 *)
 let func_iro (f : func_def) (print_l : bool) : ir_func_o =
   let des_body = match des_stmt (Block f.body) with Block ss -> ss | _ -> f.body in
   let f' = { f with body = des_body } in
-  let i_env = List.fold_left (fun m p -> Enwli.add p (Var p) m) Enwli.empty f'.params in
+  let i_env = List.fold_left (fun m p -> EnvMap.add p (Var p) m) EnvMap.empty f'.params in
   let ctx0 = { func_name = f'.func_name; e_stack = ref [ i_env ]; breakb = None; continueb = None } in
   let raw_code =
     try stmt_res ctx0 false (Block f'.body) |> flatten with

@@ -1,4 +1,7 @@
 (* lib/cfg.ml *)
+(* 实现了一个编译器优化流程 *)
+(* 1.构建CFG并移除不可达的基本块（死代码消除）。
+2.在CFG上执行常量传播和常量折叠优化。 *)
 open Ir
 
 module S_set = Set.Make(String)

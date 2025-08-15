@@ -1,9 +1,9 @@
 open Ir
 open Linearscan
 
-(* --- Module-level State and Configuration --- *)
+(* --- 模块级状态和配置 --- *)
 
-let stack_frame_size = 1648
+let stack_frame_size = 1648(*固定栈帧大小*)
 let stack_offset = ref 0
 let variable_environment = Hashtbl.create 1024
 let register_map : (string, string) Hashtbl.t = Hashtbl.create 256
@@ -11,12 +11,14 @@ let spilled_variable_map : (operand, int) Hashtbl.t = Hashtbl.create 256
 
 let function_call_register_usage : (string, string list) Hashtbl.t = Hashtbl.create 16
 
-(* --- Helper Functions for Stack and Register Management --- *)
+(* --- 栈和寄存器管理辅助函数 --- *)
 
+(* 在 variable_environment 中查找一个变量的栈偏移量 *)
 let get_variable_offset var =
   try Hashtbl.find variable_environment var
   with Not_found -> failwith ("Unknown variable in environment: " ^ var)
 
+(* 为一个变量在栈上分配空间 *)
 let allocate_on_stack var =
   try get_variable_offset var
   with _ ->
@@ -34,6 +36,7 @@ let load_operand_to_register (reg : string) (op : operand) : string =
   | Reg r | Var r ->
       Printf.sprintf "\tlw %s, %d(s0)\n" reg (get_variable_offset r)
 
+(* 寄存器不足时，为spilled op分配栈空间 *)
 let allocate_spilled_slot (op : operand) =
   try Hashtbl.find spilled_variable_map op
   with _ ->
@@ -42,13 +45,15 @@ let allocate_spilled_slot (op : operand) =
     Hashtbl.add spilled_variable_map op (- !stack_offset - 4);
     - !stack_offset - 4
 
-(* --- Instruction Compilation --- *)
+(* --- 指令编译 --- *)
 
+(* 将单条中间表示（IR）指令转换为汇编代码的核心函数。它依赖于一个预先计算好的寄存器分配映射表 reg_alloc_map。 *)
 let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
     (inst : inst_r) (live_out_set : OperandSet.t) (callee_restore_code : string)
     (needs_frame : bool) : string =
   let temp_regs = ref [ "t5"; "t6"; "t4" ] in
 
+  (* 临时寄存器管理，分配临时寄存器 *)
   let alloc_temp_reg () : string =
     match !temp_regs with
     | [] -> failwith "Ran out of temporary registers for spilling"
@@ -59,6 +64,7 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
 
   (* Helper to materialize an operand into a register, handling spills. *)
   let materialize_operand (op : operand) : string * string =
+    (* 两种情况 *)
     match O_hash.find_opt reg_alloc_map op with
     | Some reg when reg <> "__SPILL__" -> ("", reg)
     | _ ->
@@ -130,6 +136,8 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
         | None -> "")
   in
   match inst with
+   (* 实现尾调用优化。它生成代码将参数加载到参数寄存器（或栈上），
+  然后直接使用 j (jump) 指令跳转到目标函数的入口，而不是使用 call，从而复用当前的栈帧 。 *)
   | TailCall (fname, args) ->
       let arg_setup_code =
         List.mapi
@@ -379,6 +387,9 @@ let compile_instruction_legacy (inst : inst_r) (needs_frame : bool) : string =
           cond_code ^ Printf.sprintf "\tbne t0, x0, %s\n" label)
   | Label label -> Printf.sprintf "%s:\n" label
 
+(* -----块和函数编译------- *)
+
+(* 编译一个完整的代码块，从块的最后一条指令开始向前遍历，逐条编译指令并累积生成的汇编代码  *)
 let compile_block (blk : block_r) (reg_alloc_map : string O_hash.t)
     (needs_frame : bool) (callee_restore_code : string) : string =
   let code_acc = ref [] in
@@ -398,6 +409,8 @@ let compile_block (blk : block_r) (reg_alloc_map : string O_hash.t)
 
   String.concat "" !code_acc
 
+(* 判断一个函数是否需要创建栈帧 *)
+  (* 如果函数调用了其他函数、有溢出的变量，或者使用了需要被调用者保存的寄存器（callee-saved registers），则需要栈帧 。 *)
 let needs_stack_frame (f : ir_func_o) (reg_alloc_map : string O_hash.t)
     (callee_saved_regs : string list) : bool =
   let calls_other_functions =
@@ -464,11 +477,12 @@ let compile_function_legacy (f : func_r) : string =
 
 
 let compile_function_optimized (f : ir_func_o) (print_alloc_details : bool) : string =
+  (* 初始化 *)
   Hashtbl.clear variable_environment;
   Hashtbl.clear register_map;
   Hashtbl.clear spilled_variable_map;
   stack_offset := 0;
-
+(* 寄存器分配：活性分析+线性扫描算法  得到reg_alloc_map *)
   Liveness.run_liveness_analysis f.blocks print_alloc_details;
   let intervals = build_live_intervals f in
   let reg_alloc_map = run_linear_scan_allocation intervals print_alloc_details in
@@ -485,7 +499,7 @@ let compile_function_optimized (f : ir_func_o) (print_alloc_details : bool) : st
     List.mapi (fun i _ -> if i < 8 then arg_regs.(i) else "") f.args
     |> List.filter (fun r -> r <> "")
   in
-
+(* ------寄存器使用分析：确定调用者保存寄存器和被调用者保存寄存器的使用情况 *)
   let final_used_caller_saved =
     List.fold_left
       (fun acc reg -> if List.mem reg acc then acc else reg :: acc)
